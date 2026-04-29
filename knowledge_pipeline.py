@@ -292,18 +292,39 @@ def _is_page_background(width: int, height: int) -> bool:
 
 def _extract_caption_near_image(page, img_xref: int) -> str:
     """
-    Search all text blocks on the page for one that looks like a figure caption
-    near the image bounding box. Searches below, above, left, and right.
-    Returns the caption string or empty string if none found.
+    Find a figure caption near an image on the page.
+    Uses get_image_info(xrefs=True) to get correct bbox, with positional
+    fallback for JPXDecode images where get_image_bbox() fails.
     """
     try:
         img_rect = None
-        for item in page.get_image_info():
+
+        # Method 1: get_image_info with xrefs=True (required to populate xref field)
+        for item in page.get_image_info(xrefs=True):
             if item.get("xref") == img_xref:
-                img_rect = fitz.Rect(item["bbox"])
+                bbox = item.get("bbox")
+                if bbox and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
+                    img_rect = fitz.Rect(bbox)
                 break
 
+        # Method 2: match by width/height from get_images() as positional fallback
+        # (works when xref matching fails, e.g. JPXDecode via Form XObject)
         if img_rect is None:
+            base_img_sizes = {}
+            for img_info in page.get_images(full=True):
+                xref, _, w, h = img_info[0], img_info[1], img_info[2], img_info[3]
+                base_img_sizes[xref] = (w, h)
+
+            target_size = base_img_sizes.get(img_xref)
+            if target_size:
+                for item in page.get_image_info(xrefs=True):
+                    if item.get("width") == target_size[0] and item.get("height") == target_size[1]:
+                        bbox = item.get("bbox")
+                        if bbox and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
+                            img_rect = fitz.Rect(bbox)
+                        break
+
+        if img_rect is None or img_rect.is_empty:
             return ""
 
         caption_pattern = re.compile(
@@ -320,20 +341,19 @@ def _extract_caption_near_image(page, img_xref: int) -> str:
             if not text or not caption_pattern.search(text):
                 continue
 
-            # Distance from image rect to this text block (from any side)
-            dx = max(0, max(bx0 - img_rect.x1, img_rect.x0 - bx1))
-            dy = max(0, max(by0 - img_rect.y1, img_rect.y0 - by1))
-            dist = (dx**2 + dy**2) ** 0.5   # Euclidean distance from nearest edge
+            # Euclidean distance from nearest edge of image to nearest edge of text block
+            # Note: caption may be inside or overlapping the image bbox, so clamp to 0
+            dx = max(0.0, max(bx0 - img_rect.x1, img_rect.x0 - bx1))
+            dy = max(0.0, max(by0 - img_rect.y1, img_rect.y0 - by1))
+            dist = (dx**2 + dy**2) ** 0.5
 
-            if dist < 150 and dist < best_dist:  # within 150 pts from any edge
+            if dist < 200 and dist < best_dist:
                 best_dist = dist
                 best_text = text
 
         return best_text[:400] if best_text else ""
     except Exception:
         return ""
-
-
 def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
     """
     Extract text chunks, images, and tables from a PDF.
