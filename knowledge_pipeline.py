@@ -23,10 +23,11 @@ import time
 import argparse
 import hashlib
 import logging
-import io
+import io as _io
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+
 
 import requests
 from bs4 import BeautifulSoup
@@ -37,7 +38,7 @@ import pandas as pd
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 # ─────────────────────────────────────────────
 # CONFIGURATION  (override via environment vars)
@@ -47,8 +48,10 @@ LIBRARY_URL         = os.getenv("GIZA_LIBRARY_URL",   "http://giza.fas.harvard.e
 CRAWL_DELAY         = float(os.getenv("CRAWL_DELAY",  "3"))       # seconds between requests
 REQUEST_TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT","30"))
 
-CHUNK_SIZE          = int(os.getenv("CHUNK_SIZE",     "1000"))
-CHUNK_OVERLAP       = int(os.getenv("CHUNK_OVERLAP",  "150"))
+CHUNK_SIZE          = int(os.getenv("CHUNK_SIZE",     "400"))   # words per chunk
+CHUNK_OVERLAP       = int(os.getenv("CHUNK_OVERLAP",  "60"))    # word overlap
+# nomic-embed-text hard limit is 8192 tokens (~6000 chars conservatively)
+MAX_CHUNK_CHARS     = int(os.getenv("MAX_CHUNK_CHARS","5500"))
 
 SIMILARITY_DISCARD  = float(os.getenv("SIMILARITY_DISCARD", "0.85"))  # above = duplicate
 SIMILARITY_CHECK    = float(os.getenv("SIMILARITY_CHECK",   "0.70"))  # between = LLM check
@@ -60,6 +63,12 @@ MODEL_NAME          = os.getenv("MODEL_NAME",  "deepseek-r1:14b")
 EMBEDDING_MODEL     = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 OLLAMA_BASE_URL     = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
+# Image filtering — page-background images are rejected if they match standard
+# page aspect ratios (A4 ~0.707, US Letter ~0.773) within this tolerance.
+# Also reject images smaller than this pixel count (decorative rules, logos etc.)
+PAGE_RATIO_TOLERANCE = float(os.getenv("PAGE_RATIO_TOLERANCE", "0.03"))
+MIN_IMAGE_PIXELS     = int(os.getenv("MIN_IMAGE_PIXELS", "10000"))   # ~100×100 px minimum
+
 # Paths
 DATA_DIR            = Path(os.getenv("DATA_DIR",    "./giza_data"))
 IMAGES_DIR          = DATA_DIR / "images"
@@ -69,6 +78,16 @@ PROGRESS_FILE       = DATA_DIR / "progress.json"
 PROCESSED_TITLES    = DATA_DIR / "processed_titles.json"
 IDEAS_CSV           = DATA_DIR / "ideas.csv"
 LOG_FILE            = DATA_DIR / "pipeline.log"
+
+# Standard page aspect ratios to detect and discard full-page background images
+_PAGE_RATIOS = [
+    0.7071,   # A4 portrait  (210/297)
+    1.4142,   # A4 landscape
+    0.7727,   # US Letter portrait  (8.5/11)
+    1.2941,   # US Letter landscape
+    0.8165,   # A3 portrait
+    1.2247,   # A3 landscape
+]
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -253,11 +272,76 @@ def _infer_doc_type(title: str, soup) -> str:
 # STAGE 2 — EXTRACT
 # ─────────────────────────────────────────────
 
+def _is_page_background(width: int, height: int) -> bool:
+    """
+    Return True if this image is almost certainly a full-page background scan
+    rather than a content illustration.
+    Detects by aspect ratio matching standard page sizes within tolerance,
+    combined with being large (>500k pixels — genuine content images are
+    rarely this large AND page-shaped simultaneously).
+    """
+    if width == 0 or height == 0:
+        return False
+    ratio = width / height
+    for page_ratio in _PAGE_RATIOS:
+        if abs(ratio - page_ratio) < PAGE_RATIO_TOLERANCE:
+            if width * height > 500_000:   # large AND page-shaped → background
+                return True
+    return False
+
+
+def _extract_caption_near_image(page, img_xref: int) -> str:
+    """
+    Search all text blocks on the page for one that looks like a figure caption
+    near the image bounding box. Searches below, above, left, and right.
+    Returns the caption string or empty string if none found.
+    """
+    try:
+        img_rect = None
+        for item in page.get_image_info():
+            if item.get("xref") == img_xref:
+                img_rect = fitz.Rect(item["bbox"])
+                break
+
+        if img_rect is None:
+            return ""
+
+        caption_pattern = re.compile(
+            r'\b(fig\.?|figure|plate|pl\.?|photo|photograph|map|plan|table)\b',
+            re.IGNORECASE
+        )
+
+        best_text = ""
+        best_dist = float("inf")
+
+        for block in page.get_text("blocks"):
+            bx0, by0, bx1, by1 = block[0], block[1], block[2], block[3]
+            text = block[4].strip()
+            if not text or not caption_pattern.search(text):
+                continue
+
+            # Distance from image rect to this text block (from any side)
+            dx = max(0, max(bx0 - img_rect.x1, img_rect.x0 - bx1))
+            dy = max(0, max(by0 - img_rect.y1, img_rect.y0 - by1))
+            dist = (dx**2 + dy**2) ** 0.5   # Euclidean distance from nearest edge
+
+            if dist < 150 and dist < best_dist:  # within 150 pts from any edge
+                best_dist = dist
+                best_text = text
+
+        return best_text[:400] if best_text else ""
+    except Exception:
+        return ""
+
+
 def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
     """
     Extract text chunks, images, and tables from a PDF.
     Returns (text_chunks, image_records).
-    image_records: list of {path, page, index, doc_id}
+    image_records: list of {path, page, index, doc_id, caption, page_number}
+
+    FIX: page-background images (full-page scans embedded as images) are
+    detected by aspect ratio and discarded. Only genuine content images kept.
     """
     doc_id   = doc_meta.get("id", hashlib.md5(str(pdf_path).encode()).hexdigest()[:10])
     doc_name = _safe_name(doc_meta.get("title", pdf_path.stem))
@@ -267,6 +351,8 @@ def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
     doc = fitz.open(str(pdf_path))
     full_text_pages = []
     image_records   = []
+    bg_discarded    = 0
+    tiny_discarded  = 0
 
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -286,47 +372,97 @@ def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
             pass
 
         # ── Images ──
+        # Use a set to track xrefs already processed on this page
+        # (same image can appear multiple times in get_images list)
+        seen_xrefs = set()
+        content_img_count = 0
+
         img_list = page.get_images(full=True)
-        for img_idx, img_info in enumerate(img_list):
+        for img_info in img_list:
             try:
-                xref        = img_info[0]
-                base_img    = doc.extract_image(xref)
-                img_bytes   = base_img["image"]
-                ext         = base_img.get("ext", "png")
-                img_filename = f"page_{page_num+1:04d}_img_{img_idx+1:03d}.{ext}"
-                img_path    = img_dir / img_filename
-                with open(img_path, "wb") as f:
-                    f.write(img_bytes)
+                xref = img_info[0]
+                if xref in seen_xrefs:
+                    continue
+                seen_xrefs.add(xref)
+
+                base_img  = doc.extract_image(xref)
+                img_bytes = base_img["image"]
+                img_w     = base_img.get("width",  0)
+                img_h     = base_img.get("height", 0)
+
+                # ── Filter 1: discard tiny images (icons, bullets, decorative rules) ──
+                if img_w * img_h < MIN_IMAGE_PIXELS:
+                    tiny_discarded += 1
+                    log.debug(f"  Discarded tiny image p{page_num+1} ({img_w}x{img_h})")
+                    continue
+
+                # ── Filter 2: discard full-page background scans ──
+                if _is_page_background(img_w, img_h):
+                    bg_discarded += 1
+                    log.debug(f"  Discarded background image p{page_num+1} ({img_w}x{img_h})")
+                    continue
+
+                content_img_count += 1
+                img_filename = f"page_{page_num+1:04d}_img_{content_img_count:03d}.png"
+                img_path     = img_dir / img_filename
+
+                # Always save as PNG via Pillow
+                pil_img = Image.open(_io.BytesIO(img_bytes)).convert("RGB")
+                pil_img.save(img_path, "PNG")
+
+                # ── Caption extraction (searches all four sides) ──
+                caption = _extract_caption_near_image(page, xref)
+
                 image_records.append({
-                    "doc_id":   doc_id,
-                    "doc_title": doc_meta.get("title",""),
-                    "page":     page_num + 1,
-                    "img_index": img_idx + 1,
-                    "path":     str(img_path),
+                    "doc_id":    doc_id,
+                    "doc_title": doc_meta.get("title", ""),
+                    "page":      page_num + 1,
+                    "img_index": content_img_count,
+                    "path":      str(img_path),
+                    "caption":   caption,
                 })
+
+                # Inject caption into page text so it gets embedded and distilled
+                if caption:
+                    page_text += f"\n[FIGURE CAPTION, p.{page_num+1}]: {caption}\n"
+
             except Exception as e:
-                log.debug(f"  Image extract error p{page_num+1} img{img_idx+1}: {e}")
+                log.debug(f"  Image extract error p{page_num+1}: {e}")
 
         full_text_pages.append(page_text)
 
     doc.close()
 
+    if bg_discarded or tiny_discarded:
+        log.info(f"  Images discarded: {bg_discarded} backgrounds, {tiny_discarded} tiny")
+
     # ── Chunk ──
     full_text = "\n".join(full_text_pages)
     chunks    = _chunk_text(full_text)
-    log.info(f"  Extracted {len(chunks)} chunks, {len(image_records)} images from {pdf_path.name}")
+    log.info(f"  Extracted {len(chunks)} chunks, {len(image_records)} content images from {pdf_path.name}")
     return chunks, image_records
 
 
 def _chunk_text(text: str) -> list[str]:
-    """Split text into overlapping chunks."""
-    words     = text.split()
-    step      = CHUNK_SIZE - CHUNK_OVERLAP
-    chunks    = []
+    """
+    Split text into overlapping word-based chunks, tagged with approximate
+    page number so claims can later reference their source page.
+    Each chunk is hard-capped at MAX_CHUNK_CHARS characters.
+    """
+    words  = text.split()
+    step   = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
+    chunks = []
+    trimmed = 0
     for i in range(0, max(1, len(words) - CHUNK_OVERLAP), step):
         chunk = " ".join(words[i : i + CHUNK_SIZE])
-        if len(chunk.strip()) > 50:          # discard near-empty chunks
-            chunks.append(chunk)
+        if len(chunk.strip()) < 50:
+            continue
+        if len(chunk) > MAX_CHUNK_CHARS:
+            chunk = chunk[:MAX_CHUNK_CHARS]
+            trimmed += 1
+        chunks.append(chunk)
+    if trimmed:
+        log.warning(f"  {trimmed} chunks were trimmed to {MAX_CHUNK_CHARS} chars (context limit)")
     return chunks
 
 def _safe_name(name: str) -> str:
@@ -350,7 +486,6 @@ def embed_chunks_with_deduplication(
     embeddings = get_embeddings()
     added = skipped = llm_checks = 0
 
-    # Page-number look-up from image records
     page_to_images = {}
     for rec in image_refs:
         page_to_images.setdefault(rec["page"], []).append(rec["path"])
@@ -358,8 +493,10 @@ def embed_chunks_with_deduplication(
     docs_to_add = []
 
     for chunk in chunks:
+        if len(chunk) > MAX_CHUNK_CHARS:
+            chunk = chunk[:MAX_CHUNK_CHARS]
+
         if not vectorstore:
-            # Nothing in DB yet — add unconditionally
             docs_to_add.append(_make_doc(chunk, doc_meta))
             added += 1
             continue
@@ -372,8 +509,6 @@ def embed_chunks_with_deduplication(
             continue
 
         best_doc, score = results[0]
-        # FAISS returns L2 distance; convert to cosine-like similarity
-        # (nomic-embed-text produces normalised vectors, so L2 ≈ 2(1-cos))
         similarity = max(0.0, 1.0 - score / 2.0)
 
         if similarity >= SIMILARITY_DISCARD:
@@ -381,7 +516,6 @@ def embed_chunks_with_deduplication(
             log.debug(f"  SKIP (sim={similarity:.3f}): {chunk[:80]}…")
 
         elif similarity >= SIMILARITY_CHECK:
-            # Ask LLM to decide
             llm_checks += 1
             is_dup = _llm_duplicate_check(chunk, best_doc.page_content, llm)
             if is_dup:
@@ -390,12 +524,10 @@ def embed_chunks_with_deduplication(
             else:
                 docs_to_add.append(_make_doc(chunk, doc_meta))
                 added += 1
-
         else:
             docs_to_add.append(_make_doc(chunk, doc_meta))
             added += 1
 
-    # Batch-add to vectorstore
     if docs_to_add:
         if vectorstore:
             vectorstore.add_documents(docs_to_add)
@@ -452,21 +584,48 @@ TEXT:
 Task: Identify up to {max_claims} distinct factual claims, measurements, or interpretations that THIS document contributes.
 
 Rules:
-- Express each claim as a single, self-contained sentence.
-- Include specific numbers, measurements, dates, or named findings.
+- Express each claim in 2-4 sentences.
+- The FIRST sentence must state the finding with any specific numbers, measurements, or dates.
+- The SECOND sentence must provide context: what object, structure, tomb, or material is being described, and where it is located.
+- If relevant, add a third sentence explaining the method used or the significance of the finding.
+- If the text includes a figure caption (marked [FIGURE CAPTION]), incorporate what the figure shows into the relevant claim.
 - EXCLUDE claims that merely cite or summarise previous work without adding new data.
-- EXCLUDE vague generalities.
+- EXCLUDE vague generalities with no specific data.
 - Focus on what a researcher would specifically credit this source for.
+
+Example of good output:
+"The north wall plaster measured 2.5-4.0 cm in the primary layer. This measurement was taken from the tomb of Kay at Giza, an Old Kingdom official whose tomb paintings were analysed as part of a 1998 conservation study. X-ray diffraction of the same plaster confirmed the presence of quartz, calcite, gypsum, and dolomite."
 
 Return ONLY a numbered list. No preamble or commentary.
 """
 
+SUMMARY_PROMPT = """You are a research analyst specialising in Egyptology and ancient engineering.
+
+The following claims were distilled from:
+Title:  {title}
+Author: {author}
+Year:   {year}
+
+CLAIMS:
+{claims_text}
+
+Write a single short descriptive title (8 words maximum) that captures the primary subject matter of this document's contribution.
+Then write 2-3 sentences summarising what this document specifically contributes to the field.
+
+Format your response exactly like this:
+TITLE: <your short title here>
+SUMMARY: <your 2-3 sentence summary here>
+
+No other text.
+"""
+
+
 def distil_document(chunks: list[str], doc_meta: dict, llm) -> list[dict]:
     """
-    Ask the LLM to distil a document's chunks into distinct claims.
-    Returns list of claim dicts.
+    Ask the LLM to distil a document's chunks into distinct claims,
+    then generate a short descriptive title and summary for the document.
+    Returns list of claim dicts, each with a 'doc_summary' and 'doc_label' field.
     """
-    # Feed at most ~8000 words to stay within context
     combined = " ".join(chunks)
     words    = combined.split()
     sample   = " ".join(words[:8000])
@@ -477,7 +636,7 @@ def distil_document(chunks: list[str], doc_meta: dict, llm) -> list[dict]:
         year       = doc_meta.get("year",   "Unknown"),
         doc_type   = doc_meta.get("type",   "publication"),
         text       = sample,
-        max_claims = DISTIL_MAX_CLAIMS,
+        max_claims = DISTILL_MAX_CLAIMS,
     )
 
     response = llm.invoke(prompt)
@@ -488,17 +647,47 @@ def distil_document(chunks: list[str], doc_meta: dict, llm) -> list[dict]:
         line = re.sub(r'^\d+[\.\)]\s*', '', line).strip()
         if len(line) > 20:
             claims.append({
-                "claim":     line,
-                "doc_id":    doc_meta.get("id",     ""),
-                "title":     doc_meta.get("title",  ""),
-                "author":    doc_meta.get("author", ""),
-                "year":      doc_meta.get("year",   ""),
-                "type":      doc_meta.get("type",   ""),
-                "pdf_url":   doc_meta.get("pdf_url",""),
-                "extracted": datetime.now().isoformat(timespec="seconds"),
+                "claim":       line,
+                "doc_id":      doc_meta.get("id",     ""),
+                "title":       doc_meta.get("title",  ""),
+                "author":      doc_meta.get("author", ""),
+                "year":        doc_meta.get("year",   ""),
+                "type":        doc_meta.get("type",   ""),
+                "pdf_url":     doc_meta.get("pdf_url",""),
+                "doc_label":   "",    # filled in below
+                "doc_summary": "",    # filled in below
+                "extracted":   datetime.now().isoformat(timespec="seconds"),
             })
 
     log.info(f"  Distilled {len(claims)} claims from {doc_meta.get('title','?')[:50]}")
+
+    # ── Generate short descriptive label + summary ──
+    if claims:
+        claims_text = "\n".join(f"- {c['claim']}" for c in claims[:10])
+        sum_prompt  = SUMMARY_PROMPT.format(
+            title       = doc_meta.get("title",  "Unknown"),
+            author      = doc_meta.get("author", "Unknown"),
+            year        = doc_meta.get("year",   "Unknown"),
+            claims_text = claims_text,
+        )
+        sum_response = llm.invoke(sum_prompt)
+        sum_raw      = strip_think_tags(sum_response.content)
+
+        doc_label   = ""
+        doc_summary = ""
+        for line in sum_raw.splitlines():
+            line = line.strip()
+            if line.upper().startswith("TITLE:"):
+                doc_label = line[6:].strip()
+            elif line.upper().startswith("SUMMARY:"):
+                doc_summary = line[8:].strip()
+
+        log.info(f"  Label: {doc_label}")
+
+        for c in claims:
+            c["doc_label"]   = doc_label
+            c["doc_summary"] = doc_summary
+
     return claims
 
 # ─────────────────────────────────────────────
@@ -518,7 +707,10 @@ def export_ideas():
         log.warning("No claims found. Run the pipeline first.")
         return
 
-    fieldnames = ["claim","doc_id","title","author","year","type","pdf_url","extracted"]
+    fieldnames = [
+        "claim", "doc_label", "doc_summary",
+        "doc_id", "title", "author", "year", "type", "pdf_url", "extracted"
+    ]
     with open(IDEAS_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -531,25 +723,22 @@ def export_ideas():
 # DOCUMENT PROCESSING ORCHESTRATOR
 # ─────────────────────────────────────────────
 
-def process_one(doc_meta: dict, pdf_path: Path, vectorstore, llm) -> tuple[FAISS, list[dict]]:
-    """Full pipeline for a single document. Returns updated vectorstore + claims."""
+def process_one(doc_meta: dict, pdf_path: Path, vectorstore, llm) -> tuple[FAISS, list[dict], list[dict]]:
+    """Full pipeline for a single document. Returns (updated_vectorstore, claims, image_refs)."""
     log.info(f"\n{'='*60}")
     log.info(f"Processing: {doc_meta.get('title','?')}")
     log.info(f"  Author: {doc_meta.get('author','?')}  Year: {doc_meta.get('year','?')}")
 
-    # Stage 2
     chunks, image_refs = extract_pdf(pdf_path, doc_meta)
 
-    # Stage 3
     vectorstore, added, skipped, llm_checks = embed_chunks_with_deduplication(
         chunks, doc_meta, image_refs, vectorstore, llm
     )
     save_vectorstore(vectorstore)
 
-    # Stage 4
     claims = distil_document(chunks, doc_meta, llm)
 
-    return vectorstore, claims
+    return vectorstore, claims, image_refs
 
 
 def download_pdf(url: str, dest_dir: Path, filename: str) -> Optional[Path]:
@@ -576,27 +765,25 @@ def download_pdf(url: str, dest_dir: Path, filename: str) -> Optional[Path]:
 # ─────────────────────────────────────────────
 
 def cmd_crawl(_args):
-    """Stage 1: crawl the library and build manifest."""
     manifest = crawl_library()
     print(f"\n✓ Manifest built: {len(manifest)} PDFs → {MANIFEST_FILE}")
 
 
 def cmd_run(args):
-    """Stages 2-4: process PDFs from manifest."""
     manifest = load_json(MANIFEST_FILE, None)
     if manifest is None:
         print("No manifest found. Run: python giza_pipeline.py crawl")
         return
 
-    progress        = load_json(PROGRESS_FILE, {})
-    processed_titles= load_json(PROCESSED_TITLES, [])
-    vectorstore     = load_vectorstore()
-    llm             = get_llm()
-    pdfs_dir        = DATA_DIR / "pdfs"
+    progress         = load_json(PROGRESS_FILE, {})
+    processed_titles = load_json(PROCESSED_TITLES, [])
+    vectorstore      = load_vectorstore()
+    llm              = get_llm()
+    pdfs_dir         = DATA_DIR / "pdfs"
     pdfs_dir.mkdir(exist_ok=True)
 
-    limit   = getattr(args, "limit", None)
-    done    = 0
+    limit = getattr(args, "limit", None)
+    done  = 0
 
     for entry in manifest:
         if limit and done >= limit:
@@ -605,19 +792,16 @@ def cmd_run(args):
         doc_id = entry["id"]
         title  = entry["title"]
 
-        # Skip already processed
         if doc_id in progress:
             log.debug(f"Already processed: {title[:50]}")
             continue
 
-        # Skip if title was seen before (cross-run dedup)
         if title in processed_titles:
             log.info(f"Title already in knowledge base, skipping: {title[:50]}")
             progress[doc_id] = {"skipped_title": True}
             save_json(PROGRESS_FILE, progress)
             continue
 
-        # Download PDF
         safe_filename = _safe_name(title) + ".pdf"
         pdf_path = download_pdf(entry["pdf_url"], pdfs_dir, safe_filename)
         if not pdf_path:
@@ -627,19 +811,18 @@ def cmd_run(args):
 
         time.sleep(CRAWL_DELAY)
 
-        # Process
         try:
-            vectorstore, claims = process_one(entry, pdf_path, vectorstore, llm)
+            vectorstore, claims, image_refs = process_one(entry, pdf_path, vectorstore, llm)
             progress[doc_id] = {
-                "title":  title,
-                "author": entry["author"],
-                "year":   entry["year"],
-                "claims": claims,
+                "title":     title,
+                "author":    entry["author"],
+                "year":      entry["year"],
+                "claims":    claims,
                 "completed": datetime.now().isoformat(timespec="seconds"),
             }
             if title not in processed_titles:
                 processed_titles.append(title)
-            save_json(PROGRESS_FILE,   progress)
+            save_json(PROGRESS_FILE,    progress)
             save_json(PROCESSED_TITLES, processed_titles)
             done += 1
             log.info(f"  ✓ Done ({done} this session)")
@@ -654,26 +837,30 @@ def cmd_run(args):
 
 
 def cmd_single(args):
-    """Test pipeline on a local PDF file."""
     pdf_path = Path(args.path)
     if not pdf_path.exists():
         print(f"File not found: {pdf_path}")
         return
 
-    # Build minimal metadata
     doc_meta = {
-        "id":     hashlib.md5(str(pdf_path).encode()).hexdigest()[:10],
-        "title":  args.title  or pdf_path.stem,
-        "author": args.author or "Unknown",
-        "year":   args.year   or "Unknown",
-        "type":   args.type   or "publication",
+        "id":      hashlib.md5(str(pdf_path).encode()).hexdigest()[:10],
+        "title":   args.title  or pdf_path.stem,
+        "author":  args.author or "Unknown",
+        "year":    args.year   or "Unknown",
+        "type":    args.type   or "publication",
         "pdf_url": str(pdf_path),
     }
 
     vectorstore = load_vectorstore()
     llm         = get_llm()
 
-    vectorstore, claims = process_one(doc_meta, pdf_path, vectorstore, llm)
+    vectorstore, claims, image_refs = process_one(doc_meta, pdf_path, vectorstore, llm)
+
+    # Print label and summary
+    if claims:
+        print(f"\n{'='*60}")
+        print(f"DOCUMENT LABEL:   {claims[0].get('doc_label','')}")
+        print(f"DOCUMENT SUMMARY: {claims[0].get('doc_summary','')}")
 
     print(f"\n{'='*60}")
     print(f"DISTILLED CLAIMS ({len(claims)}):")
@@ -681,13 +868,37 @@ def cmd_single(args):
     for i, c in enumerate(claims, 1):
         print(f"{i:2}. {c['claim']}")
 
-    # Save to single-run ideas CSV for easy review
-    out_csv = DATA_DIR / f"ideas_{doc_meta['id']}.csv"
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(claims[0].keys()) if claims else [])
-        writer.writeheader()
-        writer.writerows(claims)
-    print(f"\n✓ Claims exported → {out_csv}")
+    # Export claims CSV
+    if claims:
+        out_csv = DATA_DIR / f"ideas_{doc_meta['id']}.csv"
+        fieldnames = [
+            "claim", "doc_label", "doc_summary",
+            "doc_id", "title", "author", "year", "type", "pdf_url", "extracted"
+        ]
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(claims)
+        print(f"\n✓ Claims exported → {out_csv}")
+
+    # Export image index CSV with captions
+    if image_refs:
+        img_csv = DATA_DIR / f"images_{doc_meta['id']}.csv"
+        img_fields = ["doc_id", "doc_title", "page", "img_index", "path", "caption"]
+        with open(img_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=img_fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(image_refs)
+        print(f"✓ Image index exported → {img_csv}")
+
+        captioned = [r for r in image_refs if r.get("caption")]
+        print(f"\nContent images saved: {len(image_refs)}")
+        if captioned:
+            print(f"Captions found ({len(captioned)}/{len(image_refs)}):")
+            for r in captioned:
+                print(f"  p.{r['page']} img {r['img_index']}: {r['caption'][:120]}")
+        else:
+            print("No figure captions detected (captions may use non-standard labels).")
 
 
 def cmd_export(_args):
@@ -695,7 +906,6 @@ def cmd_export(_args):
 
 
 def cmd_purge(_args):
-    """Wipe vector store, progress, and processed titles."""
     import shutil
     confirm = input("This will delete the vector store, progress, and processed titles. Type YES to confirm: ")
     if confirm.strip().upper() != "YES":
@@ -712,14 +922,13 @@ def cmd_purge(_args):
 
 
 def cmd_status(_args):
-    """Show pipeline progress summary."""
     manifest  = load_json(MANIFEST_FILE,  [])
     progress  = load_json(PROGRESS_FILE,  {})
     titles    = load_json(PROCESSED_TITLES, [])
 
     total        = len(manifest)
-    completed    = sum(1 for v in progress.values() if "claims"       in v)
-    errors       = sum(1 for v in progress.values() if "error"        in v)
+    completed    = sum(1 for v in progress.values() if "claims"        in v)
+    errors       = sum(1 for v in progress.values() if "error"         in v)
     skipped      = sum(1 for v in progress.values() if "skipped_title" in v)
     remaining    = total - len(progress)
     total_claims = sum(len(v.get("claims", [])) for v in progress.values())
