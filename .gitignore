@@ -1,4 +1,4 @@
 .env
 *.pdf
-giza_data
+pipeline_data
 .venv
