@@ -62,7 +62,7 @@ REQUEST_TIMEOUT      = int(os.getenv("REQUEST_TIMEOUT","30"))
 
 CHUNK_SIZE           = int(os.getenv("CHUNK_SIZE",     "400"))
 CHUNK_OVERLAP        = int(os.getenv("CHUNK_OVERLAP",  "60"))
-MAX_CHUNK_CHARS      = int(os.getenv("MAX_CHUNK_CHARS","5500"))
+MAX_CHUNK_CHARS      = int(os.getenv("MAX_CHUNK_CHARS","3500"))
 
 SIMILARITY_DISCARD   = float(os.getenv("SIMILARITY_DISCARD","0.85"))
 SIMILARITY_CHECK     = float(os.getenv("SIMILARITY_CHECK",  "0.70"))
@@ -132,6 +132,13 @@ def get_embeddings() -> OllamaEmbeddings:
     return OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
 
 def embed_text(text: str) -> list[float]:
+    # Truncate by words first, then chars — handles token-dense content
+    # (barcodes, hex strings, codes) where chars-per-token ratio is high
+    words = text.split()
+    if len(words) > CHUNK_SIZE:
+        text = " ".join(words[:CHUNK_SIZE])
+    if len(text) > MAX_CHUNK_CHARS:
+        text = text[:MAX_CHUNK_CHARS]
     return get_embeddings().embed_query(text)
 
 def strip_think_tags(text: str) -> str:
@@ -217,12 +224,14 @@ def crawl_library() -> list[dict]:
     for a in soup.find_all("a", href=True):
         href = a["href"]
         full = href if href.startswith("http") else base_url + href
-        # Only follow links that are within the /library/ section
-        if "/library/" not in full:
+        # Accept direct PDF links from any path on the same domain
+        if full.lower().endswith(".pdf"):
+            if full not in doc_links:
+                doc_links.append(full)
             continue
-        if full == LIBRARY_URL or full in doc_links:
-            continue
-        doc_links.append(full)
+        # Also follow library section pages that may contain more PDF links
+        if "/library/" in full and full != LIBRARY_URL and full not in doc_links:
+            doc_links.append(full)
 
     log.info(f"Found {len(doc_links)} candidate document pages")
 
@@ -567,19 +576,24 @@ def embed_chunks_with_deduplication(
         if len(chunk) > MAX_CHUNK_CHARS:
             chunk = chunk[:MAX_CHUNK_CHARS]
 
-        vector = embed_text(chunk)
+        try:
+            vector = embed_text(chunk)
+        except Exception as e:
+            log.warning(f"  Skipping chunk (embed failed: {e}): {chunk[:60]}...")
+            skipped += 1
+            continue
 
         if is_empty:
             points.append(_make_point(chunk, vector, doc_meta))
             added += 1
             continue
 
-        hits = client.search(
+        results = client.query_points(
             collection_name=QDRANT_COLLECTION,
-            query_vector=vector,
+            query=vector,
             limit=1,
-            score_threshold=0.0,
         )
+        hits = results.points
 
         if not hits:
             points.append(_make_point(chunk, vector, doc_meta))
