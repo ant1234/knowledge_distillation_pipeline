@@ -25,6 +25,7 @@ import time
 import argparse
 import hashlib
 import logging
+import threading
 import io as _io
 from pathlib import Path
 from datetime import datetime
@@ -126,6 +127,7 @@ def get_llm() -> ChatOllama:
         base_url=OLLAMA_BASE_URL,
         temperature=TEMPERATURE,
         num_predict=MAX_TOKENS,
+        timeout=120,
     )
 
 def get_embeddings() -> OllamaEmbeddings:
@@ -143,6 +145,30 @@ def embed_text(text: str) -> list[float]:
 
 def strip_think_tags(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+def _invoke_with_timeout(llm, prompt, timeout_seconds=120):
+    """Run llm.invoke in a thread — kill it if it exceeds timeout."""
+    result = [None]
+    error  = [None]
+
+    def target():
+        try:
+            result[0] = llm.invoke(prompt).content
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout=timeout_seconds)
+
+    if t.is_alive():
+        log.warning(f"  LLM call timed out after {timeout_seconds}s — skipping")
+        return None  # thread keeps running as daemon but we move on
+
+    if error[0]:
+        raise error[0]
+
+    return result[0]
 
 # ─────────────────────────────────────────────
 # QDRANT
@@ -564,22 +590,36 @@ def embed_chunks_with_deduplication(
     client:     QdrantClient,
     llm:        ChatOllama,
 ) -> tuple[int, int, int]:
-    """
-    Embed each chunk, check Qdrant for near-duplicates, add novel ones.
-    Returns (added, skipped, llm_checks).
-    """
     added = skipped = llm_checks = 0
-    points: list[PointStruct] = []
-    is_empty = collection_count(client) == 0
 
+    # Truncate all chunks before batch embedding
+    safe_chunks = []
     for chunk in chunks:
+        words = chunk.split()
+        if len(words) > CHUNK_SIZE:
+            chunk = " ".join(words[:CHUNK_SIZE])
         if len(chunk) > MAX_CHUNK_CHARS:
             chunk = chunk[:MAX_CHUNK_CHARS]
+        safe_chunks.append(chunk)
 
-        try:
-            vector = embed_text(chunk)
-        except Exception as e:
-            log.warning(f"  Skipping chunk (embed failed: {e}): {chunk[:60]}...")
+    # Single batch call instead of one call per chunk
+    try:
+        vectors = get_embeddings().embed_documents(safe_chunks)
+    except Exception as e:
+        log.warning(f"  Batch embed failed ({e}), falling back to individual embedding")
+        vectors = []
+        for chunk in safe_chunks:
+            try:
+                vectors.append(embed_text(chunk))
+            except Exception as e2:
+                log.warning(f"  Skipping chunk (embed failed: {e2}): {chunk[:60]}...")
+                vectors.append(None)
+
+    is_empty = collection_count(client) == 0
+    points: list[PointStruct] = []
+
+    for chunk, vector in zip(safe_chunks, vectors):
+        if vector is None:
             skipped += 1
             continue
 
@@ -588,24 +628,28 @@ def embed_chunks_with_deduplication(
             added += 1
             continue
 
-        results = client.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=vector,
-            limit=1,
-        )
-        hits = results.points
+        try:
+            results = client.query_points(
+                collection_name=QDRANT_COLLECTION,
+                query=vector,
+                limit=1,
+            )
+            hits = results.points
+        except Exception:
+            points.append(_make_point(chunk, vector, doc_meta))
+            added += 1
+            continue
 
         if not hits:
             points.append(_make_point(chunk, vector, doc_meta))
             added += 1
             continue
 
-        similarity = hits[0].score  # true cosine similarity, 0–1
+        similarity = hits[0].score
 
         if similarity >= SIMILARITY_DISCARD:
             skipped += 1
             log.debug(f"  SKIP (sim={similarity:.3f}): {chunk[:80]}...")
-
         elif similarity >= SIMILARITY_CHECK:
             llm_checks += 1
             best_chunk = hits[0].payload.get("text", "")
@@ -624,7 +668,6 @@ def embed_chunks_with_deduplication(
 
     log.info(f"  Chunks: {added} added, {skipped} skipped, {llm_checks} LLM checks")
     return added, skipped, llm_checks
-
 
 def _make_point(chunk: str, vector: list[float], meta: dict) -> PointStruct:
     uid = hashlib.md5((chunk + meta.get("id", "")).encode()).hexdigest()
@@ -675,16 +718,24 @@ specific subject by name in EVERY sentence of EVERY claim - never write "the tom
 without the specific name. If the subject is Kay's tomb at Giza, write "Kay's tomb \
 at Giza" every time, not "the tomb".
 
-Rules:
+CRITICAL GROUNDING RULES - these override everything else:
+- ONLY extract claims that are EXPLICITLY stated in the TEXT above.
+- Do NOT use your training knowledge. Do NOT infer. Do NOT guess.
+- If the TEXT does not clearly state a fact, omit it entirely. It is better to \
+  return fewer claims than to invent or embellish.
+- Every measurement, date, name, and location in your output MUST appear verbatim \
+  in the TEXT above. If you cannot find it in the TEXT, do not write it.
+
+Formatting rules:
 - Each claim MUST be exactly 2-4 complete sentences of continuous flowing prose.
 - NO bullet points, dashes, asterisks, or sub-items of any kind within a claim.
 - Every sentence must name the specific subject (e.g. "Kay's tomb at Giza", \
   "the north wall of Kay's tomb", "Petrie's 1883 survey of the Great Pyramid").
 - Sentence 1: name the specific subject AND state the finding with numbers, \
-  measurements, or dates.
-- Sentence 2: provide further context about that same named subject - which wall, \
-  layer, material, or location.
-- Sentence 3 (if relevant): method used or significance for that same named subject.
+  measurements, or dates drawn directly from the TEXT.
+- Sentence 2: provide further context about that same named subject as stated \
+  in the TEXT - which wall, layer, material, or location.
+- Sentence 3 (if relevant): method used or significance, as stated in the TEXT.
 - If text contains [FIGURE CAPTION] markers, incorporate what the figure shows \
   into the relevant claim, naming the subject.
 - EXCLUDE claims that only cite or summarise prior work without adding new data.
@@ -706,13 +757,16 @@ Source: {title} - {author} ({year})
 Top claims from this document:
 {claims_text}
 
+CRITICAL: Your title and summary must be based ONLY on the claims listed above. \
+Do not introduce any facts, names, or details that do not appear in those claims.
+
 Tasks:
 1. Write a SHORT descriptive title (8 words maximum) that names the specific \
 subject - the exact tomb, site, person, or object - and what the document \
 contributes about it. Never use vague phrases like "conservation methods" \
 without naming what was conserved and where.
-2. Write a 2–3 sentence summary that names the specific subject in the first \
-sentence.
+2. Write a 2-3 sentence summary that names the specific subject in the first \
+sentence. Every fact in the summary must come directly from the claims above.
 
 Respond in this exact format and nothing else:
 TITLE: <title>
@@ -726,8 +780,9 @@ def distil_document(chunks: list[str], doc_meta: dict, llm: ChatOllama) -> list[
     """
     sample = " ".join(" ".join(chunks).split()[:8000])
 
-    raw = strip_think_tags(
-        llm.invoke(
+    try:
+        response = _invoke_with_timeout(
+            llm,
             DISTIL_PROMPT.format(
                 title      = doc_meta.get("title",  "Unknown"),
                 author     = doc_meta.get("author", "Unknown"),
@@ -735,20 +790,22 @@ def distil_document(chunks: list[str], doc_meta: dict, llm: ChatOllama) -> list[
                 doc_type   = doc_meta.get("type",   "publication"),
                 text       = sample,
                 max_claims = DISTILL_MAX_CLAIMS,
-            )
-        ).content
-    )
+            ),
+            timeout_seconds=120,
+        )
+        if response is None:
+            return []
+        raw = strip_think_tags(response)
+    except Exception as e:
+        log.warning(f"  Distillation failed: {e}")
+        return []
 
     now    = datetime.now().isoformat(timespec="seconds")
     claims = []
-    # Split on numbered list markers - handles both "1." and "1)"
-    # This works whether the LLM puts each claim on one line or across several
     entries = re.split(r'\n\s*\d+[\.\)]\s+', '\n' + raw)
     for entry in entries:
-        entry = entry.strip()
-        # Remove any leading dash/bullet if present
+        entry = re.sub(r'\s*\n\s*', ' ', entry).strip()
         entry = re.sub(r'^[-*]\s*', '', entry).strip()
-        # Must have at least 2 sentences (2 full stops) and reasonable length
         if entry.count('.') < 2 or len(entry) < 80:
             continue
         claims.append({
@@ -766,19 +823,24 @@ def distil_document(chunks: list[str], doc_meta: dict, llm: ChatOllama) -> list[
 
     log.info(f"  Distilled {len(claims)} claims")
 
-    # ── Generate label + summary from the top claims ──
     if claims:
         claims_text = "\n".join(f"- {c['claim']}" for c in claims[:10])
-        sum_raw     = strip_think_tags(
-            llm.invoke(
+        try:
+            sum_response = _invoke_with_timeout(
+                llm,
                 SUMMARY_PROMPT.format(
                     title       = doc_meta.get("title",  "Unknown"),
                     author      = doc_meta.get("author", "Unknown"),
                     year        = doc_meta.get("year",   "Unknown"),
                     claims_text = claims_text,
-                )
-            ).content
-        )
+                ),
+                timeout_seconds=60,
+            )
+            sum_raw = strip_think_tags(sum_response) if sum_response else ""
+        except Exception as e:
+            log.warning(f"  Summary failed: {e}")
+            sum_raw = ""
+
         doc_label = doc_summary = ""
         for line in sum_raw.splitlines():
             line = line.strip()
