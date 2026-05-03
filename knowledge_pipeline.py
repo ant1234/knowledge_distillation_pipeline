@@ -591,6 +591,7 @@ def embed_chunks_with_deduplication(
     llm:        ChatOllama,
 ) -> tuple[int, int, int]:
     added = skipped = llm_checks = 0
+    MAX_LLM_CHECKS_PER_DOC = 20
 
     # Truncate all chunks before batch embedding
     safe_chunks = []
@@ -650,15 +651,23 @@ def embed_chunks_with_deduplication(
         if similarity >= SIMILARITY_DISCARD:
             skipped += 1
             log.debug(f"  SKIP (sim={similarity:.3f}): {chunk[:80]}...")
+
         elif similarity >= SIMILARITY_CHECK:
-            llm_checks += 1
-            best_chunk = hits[0].payload.get("text", "")
-            if _llm_duplicate_check(chunk, best_chunk, llm):
-                skipped += 1
-                log.debug(f"  LLM-SKIP (sim={similarity:.3f}): {chunk[:80]}...")
-            else:
+            if llm_checks >= MAX_LLM_CHECKS_PER_DOC:
+                # Cap reached — treat as novel rather than risk a hung call
                 points.append(_make_point(chunk, vector, doc_meta))
                 added += 1
+                log.debug(f"  LLM cap reached, adding as novel: {chunk[:80]}...")
+            else:
+                llm_checks += 1
+                best_chunk = hits[0].payload.get("text", "")
+                if _llm_duplicate_check(chunk, best_chunk, llm):
+                    skipped += 1
+                    log.debug(f"  LLM-SKIP (sim={similarity:.3f}): {chunk[:80]}...")
+                else:
+                    points.append(_make_point(chunk, vector, doc_meta))
+                    added += 1
+
         else:
             points.append(_make_point(chunk, vector, doc_meta))
             added += 1
@@ -691,7 +700,10 @@ def _llm_duplicate_check(chunk_a: str, chunk_b: str, llm: ChatOllama) -> bool:
         "Answer with YES or NO only.\n\n"
         f"Passage A:\n{chunk_a[:600]}\n\nPassage B:\n{chunk_b[:600]}\n\nAnswer:"
     )
-    answer = strip_think_tags(llm.invoke(prompt).content).strip().upper()
+    response = _invoke_with_timeout(llm, prompt, timeout_seconds=30)
+    if response is None:
+        return False  # on timeout, assume not duplicate and continue
+    answer = strip_think_tags(response).strip().upper()
     return answer.startswith("Y")
 
 # ─────────────────────────────────────────────
