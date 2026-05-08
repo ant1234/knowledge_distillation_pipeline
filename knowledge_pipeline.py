@@ -12,6 +12,8 @@ Usage:
   python knowledge_pipeline.py run                  # Stages 2-4: process all PDFs
   python knowledge_pipeline.py run --limit 3        # Process at most N unprocessed
   python knowledge_pipeline.py single /path/to.pdf  # Test with a local PDF
+  python knowledge_pipeline.py folder /path/to/dir  # Process all PDFs in a folder
+  python knowledge_pipeline.py folder /path/to/dir --tier 2  # Tag with tier number
   python knowledge_pipeline.py export               # Stage 5: export claims to CSV
   python knowledge_pipeline.py purge                # Wipe DB and progress
   python knowledge_pipeline.py status               # Show progress summary
@@ -134,8 +136,6 @@ def get_embeddings() -> OllamaEmbeddings:
     return OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
 
 def embed_text(text: str) -> list[float]:
-    # Truncate by words first, then chars — handles token-dense content
-    # (barcodes, hex strings, codes) where chars-per-token ratio is high
     words = text.split()
     if len(words) > CHUNK_SIZE:
         text = " ".join(words[:CHUNK_SIZE])
@@ -162,8 +162,8 @@ def _invoke_with_timeout(llm, prompt, timeout_seconds=120):
     t.join(timeout=timeout_seconds)
 
     if t.is_alive():
-        log.warning(f"  LLM call timed out after {timeout_seconds}s — skipping")
-        return None  # thread keeps running as daemon but we move on
+        log.warning(f"  LLM call timed out after {timeout_seconds}s - skipping")
+        return None
 
     if error[0]:
         raise error[0]
@@ -175,11 +175,6 @@ def _invoke_with_timeout(llm, prompt, timeout_seconds=120):
 # ─────────────────────────────────────────────
 
 def get_qdrant() -> QdrantClient:
-    """
-    Return a Qdrant client.
-    Blank QDRANT_URL -> local in-process storage at QDRANT_PATH.
-    Set QDRANT_URL to connect to a running Qdrant server.
-    """
     if QDRANT_URL:
         log.info(f"Connecting to Qdrant server: {QDRANT_URL}")
         return QdrantClient(url=QDRANT_URL)
@@ -240,28 +235,23 @@ def crawl_library() -> list[dict]:
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Derive the base domain for relative-URL resolution
     from urllib.parse import urlparse
     parsed   = urlparse(LIBRARY_URL)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
 
-    # Collect all internal document links
     doc_links: list[str] = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         full = href if href.startswith("http") else base_url + href
-        # Accept direct PDF links from any path on the same domain
         if full.lower().endswith(".pdf"):
             if full not in doc_links:
                 doc_links.append(full)
             continue
-        # Also follow library section pages that may contain more PDF links
         if "/library/" in full and full != LIBRARY_URL and full not in doc_links:
             doc_links.append(full)
 
     log.info(f"Found {len(doc_links)} candidate document pages")
 
-    # Load existing manifest to allow safe re-runs
     existing  = load_json(MANIFEST_FILE, [])
     seen_pdfs = {e["pdf_url"] for e in existing}
     manifest  = list(existing)
@@ -270,7 +260,6 @@ def crawl_library() -> list[dict]:
         try:
             log.info(f"[{idx+1}/{len(doc_links)}] {doc_url}")
 
-            # If the link is itself a PDF, use it directly without fetching HTML
             if doc_url.lower().endswith(".pdf"):
                 pdf_url = doc_url
                 if pdf_url in seen_pdfs:
@@ -283,22 +272,22 @@ def crawl_library() -> list[dict]:
                 dtype  = "publication"
 
                 entry = {
-                    "id":       hashlib.md5(pdf_url.encode()).hexdigest()[:10],
-                    "title":    title.strip(),
-                    "author":   author,
-                    "year":     year,
-                    "type":     dtype,
-                    "pdf_url":  pdf_url,
-                    "page_url": pdf_url,
+                    "id":        hashlib.md5(pdf_url.encode()).hexdigest()[:10],
+                    "title":     title.strip(),
+                    "author":    author,
+                    "year":      year,
+                    "type":      dtype,
+                    "tier":      1,
+                    "pdf_url":   pdf_url,
+                    "page_url":  pdf_url,
                     "processed": False,
                 }
                 manifest.append(entry)
                 save_json(MANIFEST_FILE, manifest)
                 log.info(f"  + {title[:70]} [{dtype}]")
-                time.sleep(0.5)   # shorter delay - no HTML fetch needed
+                time.sleep(0.5)
                 continue
 
-            # Otherwise fetch the HTML page and look for a PDF link within it
             time.sleep(CRAWL_DELAY)
             r = session.get(doc_url, timeout=REQUEST_TIMEOUT)
             if r.status_code != 200:
@@ -326,13 +315,14 @@ def crawl_library() -> list[dict]:
             dtype  = _infer_doc_type(title, dsoup)
 
             entry = {
-                "id":       hashlib.md5(pdf_url.encode()).hexdigest()[:10],
-                "title":    title.strip(),
-                "author":   author.strip(),
-                "year":     year,
-                "type":     dtype,
-                "pdf_url":  pdf_url,
-                "page_url": doc_url,
+                "id":        hashlib.md5(pdf_url.encode()).hexdigest()[:10],
+                "title":     title.strip(),
+                "author":    author.strip(),
+                "year":      year,
+                "type":      dtype,
+                "tier":      1,
+                "pdf_url":   pdf_url,
+                "page_url":  doc_url,
                 "processed": False,
             }
             manifest.append(entry)
@@ -363,8 +353,11 @@ def _extract_year(soup) -> str:
     return m.group(0) if m else "Unknown"
 
 def _extract_year_from_url(url: str) -> str:
-    """Extract a 4-digit year from a PDF filename if present."""
     m = re.search(r'(1[89]\d{2}|20[012]\d)', url)
+    return m.group(0) if m else "Unknown"
+
+def _extract_year_from_filename(filename: str) -> str:
+    m = re.search(r'(1[89]\d{2}|20[012]\d)', filename)
     return m.group(0) if m else "Unknown"
 
 def _infer_doc_type(title: str, soup) -> str:
@@ -385,10 +378,6 @@ def _infer_doc_type(title: str, soup) -> str:
 # ─────────────────────────────────────────────
 
 def _is_page_background(width: int, height: int) -> bool:
-    """
-    True if this image matches a standard page aspect ratio AND is large -
-    indicating a full-page background scan rather than a content illustration.
-    """
     if width == 0 or height == 0:
         return False
     ratio = width / height
@@ -399,17 +388,9 @@ def _is_page_background(width: int, height: int) -> bool:
 
 
 def _extract_caption_near_image(page, img_xref: int) -> str:
-    """
-    Find a figure caption near an image on the page.
-    Uses get_image_info(xrefs=True) for accurate bbox.
-    Falls back to width/height matching for JPXDecode images where
-    get_image_bbox() raises 'bad image name'.
-    Searches within 200 pts from any edge of the image rect.
-    """
     try:
         img_rect: Optional[fitz.Rect] = None
 
-        # Method 1: xref match - requires xrefs=True to populate the xref field
         for item in page.get_image_info(xrefs=True):
             if item.get("xref") == img_xref:
                 bbox = item.get("bbox")
@@ -417,7 +398,6 @@ def _extract_caption_near_image(page, img_xref: int) -> str:
                     img_rect = fitz.Rect(bbox)
                 break
 
-        # Method 2: size-based fallback for JPXDecode / Form XObject images
         if img_rect is None:
             size_map = {img[0]: (img[2], img[3]) for img in page.get_images(full=True)}
             target   = size_map.get(img_xref)
@@ -444,7 +424,6 @@ def _extract_caption_near_image(page, img_xref: int) -> str:
             text = block[4].strip()
             if not text or not caption_re.search(text):
                 continue
-            # Euclidean distance from nearest edge of image to nearest edge of block
             dx   = max(0.0, max(bx0 - img_rect.x1, img_rect.x0 - bx1))
             dy   = max(0.0, max(by0 - img_rect.y1, img_rect.y0 - by1))
             dist = (dx**2 + dy**2) ** 0.5
@@ -458,10 +437,6 @@ def _extract_caption_near_image(page, img_xref: int) -> str:
 
 
 def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
-    """
-    Extract text chunks, content images (filtered), and tables from a PDF.
-    Returns (chunks, image_records).
-    """
     doc_id   = doc_meta.get("id", hashlib.md5(str(pdf_path).encode()).hexdigest()[:10])
     doc_name = _safe_name(doc_meta.get("title", pdf_path.stem))
     img_dir  = IMAGES_DIR / doc_name
@@ -475,7 +450,6 @@ def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
     for page_num in range(len(doc)):
         page = doc[page_num]
 
-        # ── Text - use layout engine if available for better reading order ──
         if _LAYOUT_AVAILABLE:
             page_text = page.get_text(
                 "text",
@@ -485,7 +459,6 @@ def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
         else:
             page_text = page.get_text("text")
 
-        # ── Tables ──
         try:
             for t_idx, table in enumerate(page.find_tables()):
                 df = pd.DataFrame(table.extract())
@@ -497,7 +470,6 @@ def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
         except Exception:
             pass
 
-        # ── Images ──
         seen_xrefs: set[int] = set()
         content_img_count    = 0
 
@@ -513,12 +485,10 @@ def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
                 img_w     = base_img.get("width",  0)
                 img_h     = base_img.get("height", 0)
 
-                # Discard tiny decorative images
                 if img_w * img_h < MIN_IMAGE_PIXELS:
                     tiny_discarded += 1
                     continue
 
-                # Discard full-page background scans
                 if _is_page_background(img_w, img_h):
                     bg_discarded += 1
                     continue
@@ -593,7 +563,6 @@ def embed_chunks_with_deduplication(
     added = skipped = llm_checks = 0
     MAX_LLM_CHECKS_PER_DOC = 20
 
-    # Truncate all chunks before batch embedding
     safe_chunks = []
     for chunk in chunks:
         words = chunk.split()
@@ -603,7 +572,6 @@ def embed_chunks_with_deduplication(
             chunk = chunk[:MAX_CHUNK_CHARS]
         safe_chunks.append(chunk)
 
-    # Single batch call instead of one call per chunk
     try:
         vectors = get_embeddings().embed_documents(safe_chunks)
     except Exception as e:
@@ -654,7 +622,6 @@ def embed_chunks_with_deduplication(
 
         elif similarity >= SIMILARITY_CHECK:
             if llm_checks >= MAX_LLM_CHECKS_PER_DOC:
-                # Cap reached — treat as novel rather than risk a hung call
                 points.append(_make_point(chunk, vector, doc_meta))
                 added += 1
                 log.debug(f"  LLM cap reached, adding as novel: {chunk[:80]}...")
@@ -678,6 +645,7 @@ def embed_chunks_with_deduplication(
     log.info(f"  Chunks: {added} added, {skipped} skipped, {llm_checks} LLM checks")
     return added, skipped, llm_checks
 
+
 def _make_point(chunk: str, vector: list[float], meta: dict) -> PointStruct:
     uid = hashlib.md5((chunk + meta.get("id", "")).encode()).hexdigest()
     return PointStruct(
@@ -690,6 +658,7 @@ def _make_point(chunk: str, vector: list[float], meta: dict) -> PointStruct:
             "author": meta.get("author", ""),
             "year":   meta.get("year",   ""),
             "type":   meta.get("type",   ""),
+            "tier":   meta.get("tier",   1),
         },
     )
 
@@ -702,7 +671,7 @@ def _llm_duplicate_check(chunk_a: str, chunk_b: str, llm: ChatOllama) -> bool:
     )
     response = _invoke_with_timeout(llm, prompt, timeout_seconds=30)
     if response is None:
-        return False  # on timeout, assume not duplicate and continue
+        return False
     answer = strip_think_tags(response).strip().upper()
     return answer.startswith("Y")
 
@@ -827,6 +796,7 @@ def distil_document(chunks: list[str], doc_meta: dict, llm: ChatOllama) -> list[
             "author":      doc_meta.get("author", ""),
             "year":        doc_meta.get("year",   ""),
             "type":        doc_meta.get("type",   ""),
+            "tier":        doc_meta.get("tier",   1),
             "pdf_url":     doc_meta.get("pdf_url",""),
             "doc_label":   "",
             "doc_summary": "",
@@ -882,7 +852,7 @@ def export_ideas() -> None:
 
     fieldnames = [
         "claim", "doc_label", "doc_summary",
-        "doc_id", "title", "author", "year", "type", "pdf_url", "extracted",
+        "doc_id", "title", "author", "year", "type", "tier", "pdf_url", "extracted",
     ]
     with open(IDEAS_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -905,7 +875,7 @@ def process_one(
     """Run the full pipeline for one document. Returns (claims, image_refs)."""
     log.info(f"\n{'='*60}")
     log.info(f"Processing: {doc_meta.get('title','?')}")
-    log.info(f"  Author: {doc_meta.get('author','?')}  Year: {doc_meta.get('year','?')}")
+    log.info(f"  Author: {doc_meta.get('author','?')}  Year: {doc_meta.get('year','?')}  Tier: {doc_meta.get('tier',1)}")
 
     chunks, image_refs = extract_pdf(pdf_path, doc_meta)
     embed_chunks_with_deduplication(chunks, doc_meta, image_refs, client, llm)
@@ -966,12 +936,10 @@ def cmd_run(args) -> None:
         doc_id = entry["id"]
         title  = entry["title"]
 
-        # Already processed in a previous run
         if doc_id in progress:
             log.debug(f"Already done: {title[:60]}")
             continue
 
-        # Title seen before from a different source - skip
         if title in processed_titles:
             log.info(f"Title already in knowledge base, skipping: {title[:60]}")
             progress[doc_id] = {"skipped_title": True}
@@ -994,6 +962,7 @@ def cmd_run(args) -> None:
                 "title":     title,
                 "author":    entry["author"],
                 "year":      entry["year"],
+                "tier":      entry.get("tier", 1),
                 "claims":    claims,
                 "completed": datetime.now().isoformat(timespec="seconds"),
             }
@@ -1013,6 +982,103 @@ def cmd_run(args) -> None:
     print(f"\nSession: {done} processed this run, {total} total in knowledge base.")
 
 
+def cmd_folder(args) -> None:
+    """
+    Process all PDFs found in a local folder (and subfolders).
+    Useful for Tier 2/3/4 manually downloaded sources.
+    Each PDF is processed through the full pipeline.
+    Already-processed titles are skipped automatically.
+
+    Usage:
+      python knowledge_pipeline.py folder /path/to/pdfs
+      python knowledge_pipeline.py folder /path/to/pdfs --tier 2
+      python knowledge_pipeline.py folder /path/to/pdfs --tier 3 --limit 20
+    """
+    folder = Path(args.folder_path)
+    if not folder.exists() or not folder.is_dir():
+        print(f"Folder not found: {folder}")
+        return
+
+    tier  = getattr(args, "tier",  1)
+    limit = getattr(args, "limit", None)
+
+    # Collect all PDFs recursively, sorted alphabetically
+    pdf_files = sorted(folder.rglob("*.pdf"))
+    if not pdf_files:
+        print(f"No PDF files found in {folder}")
+        return
+
+    log.info(f"Found {len(pdf_files)} PDF(s) in {folder} (Tier {tier})")
+
+    progress         = load_json(PROGRESS_FILE, {})
+    processed_titles = load_json(PROCESSED_TITLES, [])
+
+    client = get_qdrant()
+    ensure_collection(client)
+    llm    = get_llm()
+
+    done = 0
+
+    for pdf_path in pdf_files:
+        if limit and done >= limit:
+            break
+
+        # Derive metadata from filename
+        stem   = pdf_path.stem
+        title  = stem.replace("_", " ").replace("-", " ").title()
+        year   = _extract_year_from_filename(stem)
+        doc_id = hashlib.md5(str(pdf_path.resolve()).encode()).hexdigest()[:10]
+
+        # Skip if already processed by ID
+        if doc_id in progress:
+            log.debug(f"Already done: {title[:60]}")
+            continue
+
+        # Skip if title already in knowledge base from any source
+        if title in processed_titles:
+            log.info(f"Title already in knowledge base, skipping: {title[:60]}")
+            progress[doc_id] = {"skipped_title": True}
+            save_json(PROGRESS_FILE, progress)
+            continue
+
+        doc_meta = {
+            "id":      doc_id,
+            "title":   title,
+            "author":  "Unknown",
+            "year":    year,
+            "type":    "publication",
+            "tier":    tier,
+            "pdf_url": str(pdf_path.resolve()),
+        }
+
+        log.info(f"  [{done+1}] {pdf_path.name}")
+
+        try:
+            claims, _ = process_one(doc_meta, pdf_path, client, llm)
+            progress[doc_id] = {
+                "title":     title,
+                "author":    "Unknown",
+                "year":      year,
+                "tier":      tier,
+                "claims":    claims,
+                "completed": datetime.now().isoformat(timespec="seconds"),
+            }
+            if title not in processed_titles:
+                processed_titles.append(title)
+            save_json(PROGRESS_FILE,    progress)
+            save_json(PROCESSED_TITLES, processed_titles)
+            done += 1
+            log.info(f"  Done ({done} this session)")
+
+        except Exception as exc:
+            log.error(f"  Failed on {pdf_path.name}: {exc}", exc_info=True)
+            progress[doc_id] = {"error": str(exc)}
+            save_json(PROGRESS_FILE, progress)
+
+    total = sum(1 for v in progress.values() if "claims" in v)
+    print(f"\nSession: {done} processed this run, {total} total in knowledge base.")
+
+
 def cmd_single(args) -> None:
     pdf_path = Path(args.path)
     if not pdf_path.exists():
@@ -1025,6 +1091,7 @@ def cmd_single(args) -> None:
         "author":  args.author or "Unknown",
         "year":    args.year   or "Unknown",
         "type":    args.type   or "publication",
+        "tier":    getattr(args, "tier", 1),
         "pdf_url": str(pdf_path),
     }
 
@@ -1049,7 +1116,7 @@ def cmd_single(args) -> None:
         out_csv = DATA_DIR / f"ideas_{doc_meta['id']}.csv"
         fieldnames = [
             "claim", "doc_label", "doc_summary",
-            "doc_id", "title", "author", "year", "type", "pdf_url", "extracted",
+            "doc_id", "title", "author", "year", "type", "tier", "pdf_url", "extracted",
         ]
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -1124,6 +1191,13 @@ def cmd_status(_args) -> None:
     remaining    = total - len(progress)
     total_claims = sum(len(v.get("claims", [])) for v in progress.values())
 
+    # Count by tier
+    tier_counts: dict[int, int] = {}
+    for v in progress.values():
+        if "claims" in v:
+            t = v.get("tier", 1)
+            tier_counts[t] = tier_counts.get(t, 0) + 1
+
     try:
         client   = get_qdrant()
         ensure_collection(client)
@@ -1143,6 +1217,11 @@ def cmd_status(_args) -> None:
     print(f"  Total claims   : {total_claims}")
     print(f"  Unique titles  : {len(titles)}")
     print(f"  Qdrant vectors : {qdrant_n}")
+    if tier_counts:
+        print(f"  By tier        :", end="")
+        for t in sorted(tier_counts):
+            print(f"  Tier {t}: {tier_counts[t]}", end="")
+        print()
     print(f"{'='*44}\n")
 
 # ─────────────────────────────────────────────
@@ -1159,13 +1238,24 @@ def main() -> None:
 
     sub.add_parser("crawl", help="Stage 1: crawl library, build manifest")
 
-    p_run = sub.add_parser("run", help="Stages 2-4: process PDFs")
+    p_run = sub.add_parser("run", help="Stages 2-4: process PDFs from manifest")
     p_run.add_argument(
         "--limit", type=int, default=None,
         help="Process at most N unprocessed documents this session",
     )
 
-    p_single = sub.add_parser("single", help="Test pipeline on a local PDF")
+    p_folder = sub.add_parser("folder", help="Process all PDFs in a local folder")
+    p_folder.add_argument("folder_path", help="Path to folder containing PDFs")
+    p_folder.add_argument(
+        "--tier", type=int, default=1,
+        help="Source tier (1=Harvard, 2=public domain, 3=academic, 4=fringe). Default: 1",
+    )
+    p_folder.add_argument(
+        "--limit", type=int, default=None,
+        help="Process at most N PDFs this session",
+    )
+
+    p_single = sub.add_parser("single", help="Test pipeline on a single local PDF")
     p_single.add_argument("path", help="Path to PDF file")
     p_single.add_argument("--title",  default=None)
     p_single.add_argument("--author", default=None)
@@ -1173,6 +1263,10 @@ def main() -> None:
     p_single.add_argument(
         "--type", default=None,
         help="publication / book / article / field_report / thesis",
+    )
+    p_single.add_argument(
+        "--tier", type=int, default=1,
+        help="Source tier. Default: 1",
     )
 
     sub.add_parser("export", help="Stage 5: export all claims to CSV")
@@ -1183,6 +1277,7 @@ def main() -> None:
     dispatch = {
         "crawl":  cmd_crawl,
         "run":    cmd_run,
+        "folder": cmd_folder,
         "single": cmd_single,
         "export": cmd_export,
         "purge":  cmd_purge,
