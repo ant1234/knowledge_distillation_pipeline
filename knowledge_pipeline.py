@@ -147,7 +147,7 @@ def strip_think_tags(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 def _invoke_with_timeout(llm, prompt, timeout_seconds=120):
-    """Run llm.invoke in a thread — kill it if it exceeds timeout."""
+    """Run llm.invoke in a thread - kill it if it exceeds timeout."""
     result = [None]
     error  = [None]
 
@@ -587,6 +587,11 @@ def embed_chunks_with_deduplication(
     is_empty = collection_count(client) == 0
     points: list[PointStruct] = []
 
+    # ── SUPPORT COUNTING ──
+    # Track which existing points need their support count incremented.
+    # Maps existing point_id -> supporting source info to add.
+    support_updates: dict[int, dict] = {}
+
     for chunk, vector in zip(safe_chunks, vectors):
         if vector is None:
             skipped += 1
@@ -617,8 +622,28 @@ def embed_chunks_with_deduplication(
         similarity = hits[0].score
 
         if similarity >= SIMILARITY_DISCARD:
+            # ── SUPPORT COUNTING CHANGE ──
+            # Instead of just discarding, record this as a supporting source
+            # for the existing similar point.
+            existing_point_id = hits[0].id
+            existing_doc_id   = hits[0].payload.get("doc_id", "")
+
+            # Only count as support if it's from a different document
+            if existing_doc_id != doc_meta.get("id", ""):
+                if existing_point_id not in support_updates:
+                    support_updates[existing_point_id] = {
+                        "existing_payload": hits[0].payload,
+                        "supporting_sources": [],
+                    }
+                support_updates[existing_point_id]["supporting_sources"].append({
+                    "doc_id": doc_meta.get("id",     ""),
+                    "title":  doc_meta.get("title",  ""),
+                    "year":   doc_meta.get("year",   ""),
+                    "tier":   doc_meta.get("tier",   1),
+                })
+
             skipped += 1
-            log.debug(f"  SKIP (sim={similarity:.3f}): {chunk[:80]}...")
+            log.debug(f"  SUPPORT (sim={similarity:.3f}): {chunk[:80]}...")
 
         elif similarity >= SIMILARITY_CHECK:
             if llm_checks >= MAX_LLM_CHECKS_PER_DOC:
@@ -629,8 +654,23 @@ def embed_chunks_with_deduplication(
                 llm_checks += 1
                 best_chunk = hits[0].payload.get("text", "")
                 if _llm_duplicate_check(chunk, best_chunk, llm):
+                    # Also track support for LLM-confirmed duplicates
+                    existing_point_id = hits[0].id
+                    existing_doc_id   = hits[0].payload.get("doc_id", "")
+                    if existing_doc_id != doc_meta.get("id", ""):
+                        if existing_point_id not in support_updates:
+                            support_updates[existing_point_id] = {
+                                "existing_payload": hits[0].payload,
+                                "supporting_sources": [],
+                            }
+                        support_updates[existing_point_id]["supporting_sources"].append({
+                            "doc_id": doc_meta.get("id",     ""),
+                            "title":  doc_meta.get("title",  ""),
+                            "year":   doc_meta.get("year",   ""),
+                            "tier":   doc_meta.get("tier",   1),
+                        })
                     skipped += 1
-                    log.debug(f"  LLM-SKIP (sim={similarity:.3f}): {chunk[:80]}...")
+                    log.debug(f"  LLM-SUPPORT (sim={similarity:.3f}): {chunk[:80]}...")
                 else:
                     points.append(_make_point(chunk, vector, doc_meta))
                     added += 1
@@ -639,10 +679,45 @@ def embed_chunks_with_deduplication(
             points.append(_make_point(chunk, vector, doc_meta))
             added += 1
 
+    # ── APPLY SUPPORT COUNT UPDATES ──
+    # For each existing point that gained supporting sources, update its payload.
+    for point_id, update_data in support_updates.items():
+        try:
+            existing_payload = update_data["existing_payload"]
+            new_sources      = update_data["supporting_sources"]
+
+            # Get current support data
+            current_count   = existing_payload.get("support_count", 0)
+            current_sources = existing_payload.get("supporting_sources", [])
+
+            # Deduplicate by doc_id — don't count same doc twice
+            existing_doc_ids = {s["doc_id"] for s in current_sources}
+            unique_new = [s for s in new_sources if s["doc_id"] not in existing_doc_ids]
+
+            if unique_new:
+                updated_payload = dict(existing_payload)
+                updated_payload["support_count"]       = current_count + len(unique_new)
+                updated_payload["supporting_sources"]  = current_sources + unique_new
+
+                client.set_payload(
+                    collection_name=QDRANT_COLLECTION,
+                    payload=updated_payload,
+                    points=[point_id],
+                )
+                log.debug(f"  Updated support count for point {point_id}: {updated_payload['support_count']}")
+        except Exception as e:
+            log.debug(f"  Support update failed for point {point_id}: {e}")
+
     if points:
         client.upsert(collection_name=QDRANT_COLLECTION, points=points)
 
-    log.info(f"  Chunks: {added} added, {skipped} skipped, {llm_checks} LLM checks")
+    support_count = sum(
+        len(v["supporting_sources"]) for v in support_updates.values()
+    )
+    log.info(
+        f"  Chunks: {added} added, {skipped} skipped "
+        f"({support_count} support links recorded), {llm_checks} LLM checks"
+    )
     return added, skipped, llm_checks
 
 
@@ -652,13 +727,16 @@ def _make_point(chunk: str, vector: list[float], meta: dict) -> PointStruct:
         id=int(uid[:8], 16),
         vector=vector,
         payload={
-            "text":   chunk,
-            "doc_id": meta.get("id",     ""),
-            "title":  meta.get("title",  ""),
-            "author": meta.get("author", ""),
-            "year":   meta.get("year",   ""),
-            "type":   meta.get("type",   ""),
-            "tier":   meta.get("tier",   1),
+            "text":               chunk,
+            "doc_id":             meta.get("id",     ""),
+            "title":              meta.get("title",  ""),
+            "author":             meta.get("author", ""),
+            "year":               meta.get("year",   ""),
+            "type":               meta.get("type",   ""),
+            "tier":               meta.get("tier",   1),
+            # Support counting fields — start at 0 for every new point
+            "support_count":      0,
+            "supporting_sources": [],
         },
     )
 
@@ -790,17 +868,22 @@ def distil_document(chunks: list[str], doc_meta: dict, llm: ChatOllama) -> list[
         if entry.count('.') < 2 or len(entry) < 80:
             continue
         claims.append({
-            "claim":       entry,
-            "doc_id":      doc_meta.get("id",     ""),
-            "title":       doc_meta.get("title",  ""),
-            "author":      doc_meta.get("author", ""),
-            "year":        doc_meta.get("year",   ""),
-            "type":        doc_meta.get("type",   ""),
-            "tier":        doc_meta.get("tier",   1),
-            "pdf_url":     doc_meta.get("pdf_url",""),
-            "doc_label":   "",
-            "doc_summary": "",
-            "extracted":   now,
+            "claim":               entry,
+            "doc_id":              doc_meta.get("id",     ""),
+            "title":               doc_meta.get("title",  ""),
+            "author":              doc_meta.get("author", ""),
+            "year":                doc_meta.get("year",   ""),
+            "type":                doc_meta.get("type",   ""),
+            "tier":                doc_meta.get("tier",   1),
+            "pdf_url":             doc_meta.get("pdf_url",""),
+            "doc_label":           "",
+            "doc_summary":         "",
+            "extracted":           now,
+            # Support counting fields on each claim — populated after Qdrant
+            # has been queried for supporting sources at export time.
+            # During distillation we set defaults; the export step enriches them.
+            "support_count":       0,
+            "supporting_sources":  "",
         })
 
     log.info(f"  Distilled {len(claims)} claims")
@@ -843,6 +926,14 @@ def distil_document(chunks: list[str], doc_meta: dict, llm: ChatOllama) -> list[
 # ─────────────────────────────────────────────
 
 def export_ideas() -> None:
+    """
+    Export all claims to CSV, enriched with support counts and sources
+    from the Qdrant vector store.
+
+    The support_count on each claim reflects how many OTHER documents
+    contained chunks similar enough to be deduplicated against the chunk
+    that generated this claim. Higher = more independently confirmed.
+    """
     progress   = load_json(PROGRESS_FILE, {})
     all_claims = [c for rec in progress.values() for c in rec.get("claims", [])]
 
@@ -850,17 +941,82 @@ def export_ideas() -> None:
         log.warning("No claims to export - run the pipeline first.")
         return
 
+    # ── ENRICH CLAIMS WITH SUPPORT DATA FROM QDRANT ──
+    # For each claim, find the corresponding Qdrant point and pull its
+    # support_count and supporting_sources into the claim dict.
+    log.info("  Enriching claims with support data from Qdrant...")
+    try:
+        client = get_qdrant()
+        enriched = 0
+        for claim in all_claims:
+            try:
+                # Embed the claim text to find its Qdrant point
+                claim_text = claim.get("claim", "")
+                if not claim_text:
+                    continue
+
+                # Truncate for embedding
+                words = claim_text.split()
+                if len(words) > CHUNK_SIZE:
+                    claim_text = " ".join(words[:CHUNK_SIZE])
+                if len(claim_text) > MAX_CHUNK_CHARS:
+                    claim_text = claim_text[:MAX_CHUNK_CHARS]
+
+                vector = get_embeddings().embed_query(claim_text)
+
+                results = client.query_points(
+                    collection_name=QDRANT_COLLECTION,
+                    query=vector,
+                    limit=1,
+                )
+
+                if results.points:
+                    hit = results.points[0]
+                    # Only use if it's from the same document
+                    if hit.payload.get("doc_id") == claim.get("doc_id"):
+                        sc = hit.payload.get("support_count", 0)
+                        ss = hit.payload.get("supporting_sources", [])
+                        claim["support_count"] = sc
+                        # Serialise supporting sources as pipe-delimited string
+                        # e.g. "Petrie 1883|Vyse 1840|Smyth 1867"
+                        claim["supporting_sources"] = "|".join(
+                            f"{s.get('title','?')} ({s.get('year','?')})"
+                            for s in ss
+                        )
+                        if sc > 0:
+                            enriched += 1
+            except Exception:
+                pass
+
+        log.info(f"  {enriched} claims enriched with support data")
+    except Exception as e:
+        log.warning(f"  Could not enrich with support data: {e}")
+
     fieldnames = [
         "claim", "doc_label", "doc_summary",
-        "doc_id", "title", "author", "year", "type", "tier", "pdf_url", "extracted",
+        "doc_id", "title", "author", "year", "type", "tier",
+        "support_count", "supporting_sources",
+        "pdf_url", "extracted",
     ]
     with open(IDEAS_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(all_claims)
 
+    # Summary stats
+    total_support = sum(c.get("support_count", 0) for c in all_claims)
+    top_claims = sorted(all_claims, key=lambda c: c.get("support_count", 0), reverse=True)[:5]
+
     log.info(f"Exported {len(all_claims)} claims -> {IDEAS_CSV}")
+    log.info(f"Total support links across all claims: {total_support}")
     print(f"\n{len(all_claims)} claims -> {IDEAS_CSV}")
+    print(f"Total cross-document support links: {total_support}")
+    if top_claims and top_claims[0].get("support_count", 0) > 0:
+        print(f"\nTop 5 most-supported claims:")
+        for c in top_claims:
+            sc = c.get("support_count", 0)
+            if sc > 0:
+                print(f"  [{sc} sources] {c['claim'][:120]}...")
 
 # ─────────────────────────────────────────────
 # ORCHESTRATOR
@@ -937,8 +1093,12 @@ def cmd_run(args) -> None:
         title  = entry["title"]
 
         if doc_id in progress:
-            log.debug(f"Already done: {title[:60]}")
-            continue
+            # Retry download failures but skip everything else
+            if progress[doc_id].get("error") == "download_failed":
+                log.info(f"Retrying failed download: {title[:60]}")
+            else:
+                log.debug(f"Already done: {title[:60]}")
+                continue
 
         if title in processed_titles:
             log.info(f"Title already in knowledge base, skipping: {title[:60]}")
@@ -988,11 +1148,6 @@ def cmd_folder(args) -> None:
     Useful for Tier 2/3/4 manually downloaded sources.
     Each PDF is processed through the full pipeline.
     Already-processed titles are skipped automatically.
-
-    Usage:
-      python knowledge_pipeline.py folder /path/to/pdfs
-      python knowledge_pipeline.py folder /path/to/pdfs --tier 2
-      python knowledge_pipeline.py folder /path/to/pdfs --tier 3 --limit 20
     """
     folder = Path(args.folder_path)
     if not folder.exists() or not folder.is_dir():
@@ -1002,7 +1157,6 @@ def cmd_folder(args) -> None:
     tier  = getattr(args, "tier",  1)
     limit = getattr(args, "limit", None)
 
-    # Collect all PDFs recursively, sorted alphabetically
     pdf_files = sorted(folder.rglob("*.pdf"))
     if not pdf_files:
         print(f"No PDF files found in {folder}")
@@ -1023,18 +1177,18 @@ def cmd_folder(args) -> None:
         if limit and done >= limit:
             break
 
-        # Derive metadata from filename
         stem   = pdf_path.stem
         title  = stem.replace("_", " ").replace("-", " ").title()
         year   = _extract_year_from_filename(stem)
         doc_id = hashlib.md5(str(pdf_path.resolve()).encode()).hexdigest()[:10]
 
-        # Skip if already processed by ID
         if doc_id in progress:
-            log.debug(f"Already done: {title[:60]}")
-            continue
+            if progress[doc_id].get("error") == "download_failed":
+                log.info(f"Retrying: {title[:60]}")
+            else:
+                log.debug(f"Already done: {title[:60]}")
+                continue
 
-        # Skip if title already in knowledge base from any source
         if title in processed_titles:
             log.info(f"Title already in knowledge base, skipping: {title[:60]}")
             progress[doc_id] = {"skipped_title": True}
@@ -1116,7 +1270,9 @@ def cmd_single(args) -> None:
         out_csv = DATA_DIR / f"ideas_{doc_meta['id']}.csv"
         fieldnames = [
             "claim", "doc_label", "doc_summary",
-            "doc_id", "title", "author", "year", "type", "tier", "pdf_url", "extracted",
+            "doc_id", "title", "author", "year", "type", "tier",
+            "support_count", "supporting_sources",
+            "pdf_url", "extracted",
         ]
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -1191,7 +1347,6 @@ def cmd_status(_args) -> None:
     remaining    = total - len(progress)
     total_claims = sum(len(v.get("claims", [])) for v in progress.values())
 
-    # Count by tier
     tier_counts: dict[int, int] = {}
     for v in progress.values():
         if "claims" in v:
@@ -1248,7 +1403,7 @@ def main() -> None:
     p_folder.add_argument("folder_path", help="Path to folder containing PDFs")
     p_folder.add_argument(
         "--tier", type=int, default=1,
-        help="Source tier (1=Harvard, 2=public domain, 3=academic, 4=fringe). Default: 1",
+        help="Source tier (1=primary measurements, 2=peer reviewed, 3=alternative with measurements). Default: 1",
     )
     p_folder.add_argument(
         "--limit", type=int, default=None,
@@ -1269,7 +1424,7 @@ def main() -> None:
         help="Source tier. Default: 1",
     )
 
-    sub.add_parser("export", help="Stage 5: export all claims to CSV")
+    sub.add_parser("export", help="Stage 5: export all claims to CSV with support counts")
     sub.add_parser("purge",  help="Wipe vector DB and progress files")
     sub.add_parser("status", help="Show progress summary")
 
