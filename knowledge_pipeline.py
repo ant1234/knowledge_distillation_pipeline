@@ -70,9 +70,14 @@ MAX_CHUNK_CHARS      = int(os.getenv("MAX_CHUNK_CHARS","3500"))
 SIMILARITY_DISCARD   = float(os.getenv("SIMILARITY_DISCARD","0.85"))
 SIMILARITY_CHECK     = float(os.getenv("SIMILARITY_CHECK",  "0.70"))
 
-DISTILL_MAX_CLAIMS   = int(os.getenv("DISTILL_MAX_CLAIMS",  "20"))
+DISTILL_MAX_CLAIMS   = int(os.getenv("DISTILL_MAX_CLAIMS",  "40"))
+# Words sent to the LLM per distillation batch.
+# Every word of every document is processed — no truncation.
+# 6000 words ≈ one batch call of ~2 minutes for deepseek-r1:14b.
+DISTILL_BATCH_WORDS  = int(os.getenv("DISTILL_BATCH_WORDS", "6000"))
+
 TEMPERATURE          = float(os.getenv("TEMPERATURE",       "0.3"))
-MAX_TOKENS           = int(os.getenv("MAX_TOKENS",          "4096"))
+MAX_TOKENS           = int(os.getenv("MAX_TOKENS",          "8192"))
 MODEL_NAME           = os.getenv("MODEL_NAME",      "deepseek-r1:14b")
 EMBEDDING_MODEL      = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 OLLAMA_BASE_URL      = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -815,67 +820,139 @@ OR the single word NONE if no functional claims exist. \
 No preamble. No commentary.
 """
 
+
 def distil_document(
     chunks: list[str],
     doc_meta: dict,
     llm: ChatOllama,
 ) -> tuple[list[dict], list[dict]]:
+    """
+    Distil ALL chunks into factual and functional claims.
+
+    The document is split into batches of DISTILL_BATCH_WORDS words and every
+    batch is processed separately. This means no content is ever left behind
+    regardless of document length — a 3000-page book is fully processed.
+
+    Cross-batch deduplication is handled by fingerprint sets so the same
+    claim is never recorded twice even if it appears in multiple batches.
+
+    Returns (claims, functional_claims).
+    """
     if not chunks:
         log.info("  No chunks to distil")
         return [], []
 
-    sample = " ".join(" ".join(chunks).split()[:8000])
-    now    = datetime.now().isoformat(timespec="seconds")
+    now = datetime.now().isoformat(timespec="seconds")
 
-    # ── FACTUAL CLAIMS ──
-    claims: list[dict] = []
-    try:
-        response = _invoke_with_timeout(
-            llm,
-            DISTIL_PROMPT.format(
-                title      = doc_meta.get("title",  "Unknown"),
-                author     = doc_meta.get("author", "Unknown"),
-                year       = doc_meta.get("year",   "Unknown"),
-                doc_type   = doc_meta.get("type",   "publication"),
-                text       = sample,
-                max_claims = DISTILL_MAX_CLAIMS,
-            ),
-            timeout_seconds=120,
-        )
-        if response is not None:
-            raw = strip_think_tags(response).strip()
-            if raw.upper() != "NONE":
-                entries = re.split(r'\n\s*\d+[\.\)]\s+', '\n' + raw)
-                seen_claims: set[str] = set()
-                for entry in entries:
-                    entry = re.sub(r'\s*\n\s*', ' ', entry).strip()
-                    entry = re.sub(r'^[-*]\s*', '', entry).strip()
-                    if entry.count('.') < 2 or len(entry) < 80:
-                        continue
-                    fingerprint = entry[:120].lower()
-                    if fingerprint in seen_claims:
-                        continue
-                    seen_claims.add(fingerprint)
-                    claims.append({
-                        "claim":              entry,
-                        "doc_id":             doc_meta.get("id",     ""),
-                        "title":              doc_meta.get("title",  ""),
-                        "author":             doc_meta.get("author", ""),
-                        "year":               doc_meta.get("year",   ""),
-                        "type":               doc_meta.get("type",   ""),
-                        "tier":               doc_meta.get("tier",   1),
-                        "pdf_url":            doc_meta.get("pdf_url",""),
-                        "doc_label":          "",
-                        "doc_summary":        "",
-                        "extracted":          now,
-                        "support_count":      0,
-                        "supporting_sources": "",
-                    })
-    except Exception as e:
-        log.warning(f"  Distillation failed: {e}")
+    # ── Split all document words into fixed-size batches ───────────────────
+    # No truncation — the while loop runs until every word is processed.
+    all_words   = " ".join(chunks).split()
+    total_words = len(all_words)
+    batches: list[str] = []
+    i = 0
+    while i < total_words:
+        batches.append(" ".join(all_words[i : i + DISTILL_BATCH_WORDS]))
+        i += DISTILL_BATCH_WORDS
 
-    log.info(f"  Distilled {len(claims)} claims")
+    log.info(
+        f"  Distilling {total_words:,} words across "
+        f"{len(batches)} batch(es) of ~{DISTILL_BATCH_WORDS:,} words"
+    )
 
+    # ── Per-document deduplication sets ────────────────────────────────────
+    # Fingerprints are checked across ALL batches so a repeated claim in
+    # batch 3 that already appeared in batch 1 is silently dropped.
+    all_claim_texts: list[str] = []
+    all_func_texts:  list[str] = []
+    seen_claim_fps:  set[str]  = set()
+    seen_func_fps:   set[str]  = set()
+
+    for batch_num, batch_text in enumerate(batches, 1):
+        log.info(f"  Batch {batch_num}/{len(batches)}...")
+
+        # ── Factual claims for this batch ──────────────────────────────────
+        try:
+            response = _invoke_with_timeout(
+                llm,
+                DISTIL_PROMPT.format(
+                    title      = doc_meta.get("title",  "Unknown"),
+                    author     = doc_meta.get("author", "Unknown"),
+                    year       = doc_meta.get("year",   "Unknown"),
+                    doc_type   = doc_meta.get("type",   "publication"),
+                    text       = batch_text,
+                    max_claims = DISTILL_MAX_CLAIMS,
+                ),
+                timeout_seconds=120,
+            )
+            if response is not None:
+                raw = strip_think_tags(response).strip()
+                if raw.upper() != "NONE":
+                    for entry in re.split(r'\n\s*\d+[\.\)]\s+', '\n' + raw):
+                        entry = re.sub(r'\s*\n\s*', ' ', entry).strip()
+                        entry = re.sub(r'^[-*]\s*', '', entry).strip()
+                        if entry.count('.') < 2 or len(entry) < 80:
+                            continue
+                        fp = entry[:120].lower()
+                        if fp not in seen_claim_fps:
+                            seen_claim_fps.add(fp)
+                            all_claim_texts.append(entry)
+        except Exception as e:
+            log.warning(f"  Batch {batch_num} factual distillation failed: {e}")
+
+        # ── Functional claims for this batch ───────────────────────────────
+        try:
+            func_response = _invoke_with_timeout(
+                llm,
+                FUNCTION_PROMPT.format(
+                    title    = doc_meta.get("title",  "Unknown"),
+                    author   = doc_meta.get("author", "Unknown"),
+                    year     = doc_meta.get("year",   "Unknown"),
+                    doc_type = doc_meta.get("type",   "publication"),
+                    text     = batch_text,
+                ),
+                timeout_seconds=120,
+            )
+            if func_response is not None:
+                func_raw = strip_think_tags(func_response).strip()
+                if func_raw.upper() != "NONE":
+                    for line in func_raw.splitlines():
+                        line = re.sub(r'^\d+[\.\)]\s*', '', line).strip()
+                        if len(line) < 30:
+                            continue
+                        fp = line[:100].lower()
+                        if fp not in seen_func_fps:
+                            seen_func_fps.add(fp)
+                            all_func_texts.append(line)
+        except Exception as e:
+            log.warning(f"  Batch {batch_num} functional distillation failed: {e}")
+
+    log.info(
+        f"  Distilled {len(all_claim_texts)} claims, "
+        f"{len(all_func_texts)} functional claims "
+        f"across {len(batches)} batch(es)"
+    )
+
+    # ── Build claim dicts ──────────────────────────────────────────────────
+    claims: list[dict] = [
+        {
+            "claim":              text,
+            "doc_id":             doc_meta.get("id",     ""),
+            "title":              doc_meta.get("title",  ""),
+            "author":             doc_meta.get("author", ""),
+            "year":               doc_meta.get("year",   ""),
+            "type":               doc_meta.get("type",   ""),
+            "tier":               doc_meta.get("tier",   1),
+            "pdf_url":            doc_meta.get("pdf_url",""),
+            "doc_label":          "",
+            "doc_summary":        "",
+            "extracted":          now,
+            "support_count":      0,
+            "supporting_sources": "",
+        }
+        for text in all_claim_texts
+    ]
+
+    # ── Generate document summary from first 10 claims ─────────────────────
     if claims:
         claims_text = "\n".join(f"- {c['claim']}" for c in claims[:10])
         try:
@@ -907,45 +984,21 @@ def distil_document(
             c["doc_label"]   = doc_label
             c["doc_summary"] = doc_summary
 
-    # ── FUNCTIONAL CLAIMS ──
-    functional_claims: list[dict] = []
-    try:
-        func_response = _invoke_with_timeout(
-            llm,
-            FUNCTION_PROMPT.format(
-                title    = doc_meta.get("title",  "Unknown"),
-                author   = doc_meta.get("author", "Unknown"),
-                year     = doc_meta.get("year",   "Unknown"),
-                doc_type = doc_meta.get("type",   "publication"),
-                text     = sample,
-            ),
-            timeout_seconds=120,
-        )
-        if func_response is not None:
-            func_raw = strip_think_tags(func_response).strip()
-            if func_raw.upper() != "NONE":
-                seen_func: set[str] = set()
-                for line in func_raw.splitlines():
-                    line = re.sub(r'^\d+[\.\)]\s*', '', line).strip()
-                    if len(line) < 30:
-                        continue
-                    fingerprint = line[:100].lower()
-                    if fingerprint in seen_func:
-                        continue
-                    seen_func.add(fingerprint)
-                    functional_claims.append({
-                        "claim":     line,
-                        "doc_id":    doc_meta.get("id",     ""),
-                        "title":     doc_meta.get("title",  ""),
-                        "author":    doc_meta.get("author", ""),
-                        "year":      doc_meta.get("year",   ""),
-                        "type":      doc_meta.get("type",   ""),
-                        "tier":      doc_meta.get("tier",   1),
-                        "pdf_url":   doc_meta.get("pdf_url",""),
-                        "extracted": now,
-                    })
-    except Exception as e:
-        log.warning(f"  Functional claims extraction failed: {e}")
+    # ── Build functional claim dicts ───────────────────────────────────────
+    functional_claims: list[dict] = [
+        {
+            "claim":     text,
+            "doc_id":    doc_meta.get("id",     ""),
+            "title":     doc_meta.get("title",  ""),
+            "author":    doc_meta.get("author", ""),
+            "year":      doc_meta.get("year",   ""),
+            "type":      doc_meta.get("type",   ""),
+            "tier":      doc_meta.get("tier",   1),
+            "pdf_url":   doc_meta.get("pdf_url",""),
+            "extracted": now,
+        }
+        for text in all_func_texts
+    ]
 
     log.info(f"  Functional claims: {len(functional_claims)}")
     return claims, functional_claims
@@ -1097,7 +1150,6 @@ def cmd_run(args) -> None:
         print("No manifest found. Run:  python knowledge_pipeline.py crawl")
         return
 
-    # Load lightweight index only - fast
     progress         = load_json(PROGRESS_FILE, {})
     processed_titles = load_json(PROCESSED_TITLES, [])
 
@@ -1144,17 +1196,14 @@ def cmd_run(args) -> None:
         try:
             claims, functional_claims, _ = process_one(entry, pdf_path, client, llm)
 
-            # Update lightweight index
             progress[doc_id] = {
-                "title":     title,
-                "year":      entry["year"],
-                "tier":      entry.get("tier", 1),
-                "completed": datetime.now().isoformat(timespec="seconds"),
+                "title":      title,
+                "year":       entry["year"],
+                "tier":       entry.get("tier", 1),
+                "completed":  datetime.now().isoformat(timespec="seconds"),
                 "has_claims": len(claims) > 0,
             }
             save_json(PROGRESS_FILE, progress)
-
-            # Write claims to separate store
             append_claims_to_store(doc_id, claims, functional_claims)
 
             if title not in processed_titles:
@@ -1169,7 +1218,7 @@ def cmd_run(args) -> None:
             progress[doc_id] = {"error": str(exc)}
             save_json(PROGRESS_FILE, progress)
 
-    total = sum(1 for v in progress.values() if v.get("has_claims"))
+    total = sum(1 for v in progress.values() if v.get("completed"))
     print(f"\nSession: {done} processed this run, {total} total in knowledge base.")
 
 
@@ -1189,7 +1238,6 @@ def cmd_folder(args) -> None:
 
     log.info(f"Found {len(pdf_files)} PDF(s) in {folder} (Tier {tier})")
 
-    # Load lightweight index only - fast
     progress         = load_json(PROGRESS_FILE, {})
     processed_titles = load_json(PROCESSED_TITLES, [])
 
@@ -1236,17 +1284,14 @@ def cmd_folder(args) -> None:
         try:
             claims, functional_claims, _ = process_one(doc_meta, pdf_path, client, llm)
 
-            # Update lightweight index
             progress[doc_id] = {
-                "title":     title,
-                "year":      year,
-                "tier":      tier,
-                "completed": datetime.now().isoformat(timespec="seconds"),
+                "title":      title,
+                "year":       year,
+                "tier":       tier,
+                "completed":  datetime.now().isoformat(timespec="seconds"),
                 "has_claims": len(claims) > 0,
             }
             save_json(PROGRESS_FILE, progress)
-
-            # Write claims to separate store
             append_claims_to_store(doc_id, claims, functional_claims)
 
             if title not in processed_titles:
@@ -1261,7 +1306,7 @@ def cmd_folder(args) -> None:
             progress[doc_id] = {"error": str(exc)}
             save_json(PROGRESS_FILE, progress)
 
-    total = sum(1 for v in progress.values() if v.get("has_claims"))
+    total = sum(1 for v in progress.values() if v.get("completed"))
     print(f"\nSession: {done} processed this run, {total} total in knowledge base.")
 
 
@@ -1376,23 +1421,22 @@ def cmd_purge(_args) -> None:
 
 def cmd_status(_args) -> None:
     manifest  = load_json(MANIFEST_FILE,  [])
-    progress  = load_json(PROGRESS_FILE,  {})   # tiny - loads instantly
+    progress  = load_json(PROGRESS_FILE,  {})
     titles    = load_json(PROCESSED_TITLES, [])
 
-    # Count claims from store only if it exists
     total_claims = 0
     total_func   = 0
     if CLAIMS_FILE.exists():
-        store = load_json(CLAIMS_FILE, {})
+        store        = load_json(CLAIMS_FILE, {})
         total_claims = sum(len(v.get("claims", []))            for v in store.values())
         total_func   = sum(len(v.get("functional_claims", [])) for v in store.values())
 
-    total     = len(manifest)
-    completed = sum(1 for v in progress.values() if v.get("completed"))
-    errors    = sum(1 for v in progress.values() if v.get("error"))
-    skipped   = sum(1 for v in progress.values() if v.get("skipped_title"))
+    total       = len(manifest)
+    completed   = sum(1 for v in progress.values() if v.get("completed"))
+    errors      = sum(1 for v in progress.values() if v.get("error"))
+    skipped     = sum(1 for v in progress.values() if v.get("skipped_title"))
     with_claims = sum(1 for v in progress.values() if v.get("has_claims"))
-    remaining = total - len(progress)
+    remaining   = total - len(progress)
 
     tier_counts: dict[int, int] = {}
     for v in progress.values():
@@ -1407,9 +1451,8 @@ def cmd_status(_args) -> None:
     except Exception:
         qdrant_n = "unavailable"
 
-    # File sizes
-    idx_size    = f"{PROGRESS_FILE.stat().st_size/1024:.0f} KB" if PROGRESS_FILE.exists() else "—"
-    claims_size = f"{CLAIMS_FILE.stat().st_size/1024/1024:.1f} MB" if CLAIMS_FILE.exists() else "—"
+    idx_size    = f"{PROGRESS_FILE.stat().st_size/1024:.0f} KB"    if PROGRESS_FILE.exists() else "—"
+    claims_size = f"{CLAIMS_FILE.stat().st_size/1024/1024:.1f} MB" if CLAIMS_FILE.exists()   else "—"
 
     print(f"\n{'='*48}")
     print(f"  KNOWLEDGE PIPELINE STATUS")
@@ -1417,14 +1460,15 @@ def cmd_status(_args) -> None:
     print(f"  Library URL       : {LIBRARY_URL or '(not set)'}")
     print(f"  Manifest PDFs     : {total}")
     print(f"  Completed         : {completed}")
+    print(f"  With claims       : {with_claims}")
     print(f"  Errors            : {errors}")
     print(f"  Skipped(title)    : {skipped}")
     print(f"  Remaining         : {remaining}")
     print(f"  Factual claims    : {total_claims}")
     print(f"  Functional claims : {total_func}")
-    print(f"  With claims       : {with_claims}")
     print(f"  Unique titles     : {len(titles)}")
     print(f"  Qdrant vectors    : {qdrant_n}")
+    print(f"  Batch size        : {DISTILL_BATCH_WORDS:,} words")
     print(f"  Index size        : {idx_size}")
     print(f"  Claims store size : {claims_size}")
     if tier_counts:
@@ -1453,7 +1497,7 @@ def main() -> None:
 
     p_folder = sub.add_parser("folder", help="Process all PDFs in a local folder")
     p_folder.add_argument("folder_path")
-    p_folder.add_argument("--tier", type=int, default=1)
+    p_folder.add_argument("--tier",  type=int, default=1)
     p_folder.add_argument("--limit", type=int, default=None)
 
     p_single = sub.add_parser("single", help="Test pipeline on a single local PDF")
