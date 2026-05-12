@@ -44,7 +44,6 @@ import pymupdf as fitz
 _LAYOUT_AVAILABLE = hasattr(fitz, '_get_layout')
 
 from langchain_ollama import OllamaEmbeddings, ChatOllama
-from langchain_core.documents import Document
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct, Filter,
@@ -88,16 +87,20 @@ DATA_DIR             = Path(os.getenv("DATA_DIR", "./pipeline_data"))
 IMAGES_DIR           = DATA_DIR / "images"
 QDRANT_PATH          = DATA_DIR / "qdrant_db"
 MANIFEST_FILE        = DATA_DIR / "manifest.json"
-PROGRESS_FILE        = DATA_DIR / "progress.json"
+
+# ── Split progress architecture ──────────────
+# PROGRESS_FILE : tiny index loaded at every session start
+#                 stores only doc_id -> status, no claims
+# CLAIMS_FILE   : append-only claims store, only read at export time
+PROGRESS_FILE        = DATA_DIR / "progress_index.json"
+CLAIMS_FILE          = DATA_DIR / "claims_store.json"
 PROCESSED_TITLES     = DATA_DIR / "processed_titles.json"
+
 IDEAS_CSV            = DATA_DIR / "ideas.csv"
 FUNCTIONS_CSV        = DATA_DIR / "functional_claims.csv"
 LOG_FILE             = DATA_DIR / "pipeline.log"
 
-# nomic-embed-text produces 768-dimensional vectors
 EMBEDDING_DIM        = 768
-
-# Standard page aspect ratios used to detect full-page background images
 _PAGE_RATIOS = [0.7071, 1.4142, 0.7727, 1.2941, 0.8165, 1.2247]
 
 # ─────────────────────────────────────────────
@@ -149,27 +152,21 @@ def strip_think_tags(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 def _invoke_with_timeout(llm, prompt, timeout_seconds=120):
-    """Run llm.invoke in a thread - kill it if it exceeds timeout."""
     result = [None]
     error  = [None]
-
     def target():
         try:
             result[0] = llm.invoke(prompt).content
         except Exception as e:
             error[0] = e
-
     t = threading.Thread(target=target, daemon=True)
     t.start()
     t.join(timeout=timeout_seconds)
-
     if t.is_alive():
         log.warning(f"  LLM call timed out after {timeout_seconds}s - skipping")
         return None
-
     if error[0]:
         raise error[0]
-
     return result[0]
 
 # ─────────────────────────────────────────────
@@ -183,7 +180,6 @@ def get_qdrant() -> QdrantClient:
     QDRANT_PATH.mkdir(parents=True, exist_ok=True)
     return QdrantClient(path=str(QDRANT_PATH))
 
-
 def ensure_collection(client: QdrantClient) -> None:
     existing = [c.name for c in client.get_collections().collections]
     if QDRANT_COLLECTION not in existing:
@@ -194,7 +190,6 @@ def ensure_collection(client: QdrantClient) -> None:
         log.info(f"Created collection '{QDRANT_COLLECTION}'")
     else:
         log.info(f"Collection '{QDRANT_COLLECTION}' ready")
-
 
 def collection_count(client: QdrantClient) -> int:
     try:
@@ -216,16 +211,23 @@ def save_json(path: Path, data) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+def append_claims_to_store(doc_id: str, claims: list, functional_claims: list) -> None:
+    """
+    Append or update a single document's claims in claims_store.json.
+    Only loads the whole file once per call - efficient for large stores.
+    """
+    store = load_json(CLAIMS_FILE, {})
+    store[doc_id] = {
+        "claims":            claims,
+        "functional_claims": functional_claims,
+    }
+    save_json(CLAIMS_FILE, store)
+
 # ─────────────────────────────────────────────
 # STAGE 1 - CRAWL
 # ─────────────────────────────────────────────
 
 def crawl_library() -> list[dict]:
-    """
-    Crawl LIBRARY_URL, collect every PDF link and its metadata.
-    Writes / merges results into manifest.json.
-    Safe to re-run - merges new entries without overwriting existing ones.
-    """
     if not LIBRARY_URL:
         raise ValueError("LIBRARY_URL is not set. Add it to your .env file.")
 
@@ -267,18 +269,13 @@ def crawl_library() -> list[dict]:
                 if pdf_url in seen_pdfs:
                     continue
                 seen_pdfs.add(pdf_url)
-
                 title  = Path(pdf_url).stem.replace("_", " ").replace("-", " ").title()
-                author = "Unknown"
-                year   = _extract_year_from_url(pdf_url)
-                dtype  = "publication"
-
                 entry = {
                     "id":        hashlib.md5(pdf_url.encode()).hexdigest()[:10],
                     "title":     title.strip(),
-                    "author":    author,
-                    "year":      year,
-                    "type":      dtype,
+                    "author":    "Unknown",
+                    "year":      _extract_year_from_url(pdf_url),
+                    "type":      "publication",
                     "tier":      1,
                     "pdf_url":   pdf_url,
                     "page_url":  pdf_url,
@@ -286,7 +283,7 @@ def crawl_library() -> list[dict]:
                 }
                 manifest.append(entry)
                 save_json(MANIFEST_FILE, manifest)
-                log.info(f"  + {title[:70]} [{dtype}]")
+                log.info(f"  + {title[:70]} [publication]")
                 time.sleep(0.5)
                 continue
 
@@ -296,8 +293,7 @@ def crawl_library() -> list[dict]:
                 log.warning(f"  Skipped (HTTP {r.status_code})")
                 continue
 
-            dsoup = BeautifulSoup(r.text, "html.parser")
-
+            dsoup   = BeautifulSoup(r.text, "html.parser")
             pdf_url = None
             for a in dsoup.find_all("a", href=True):
                 if a["href"].lower().endswith(".pdf"):
@@ -388,18 +384,15 @@ def _is_page_background(width: int, height: int) -> bool:
             return True
     return False
 
-
 def _extract_caption_near_image(page, img_xref: int) -> str:
     try:
         img_rect: Optional[fitz.Rect] = None
-
         for item in page.get_image_info(xrefs=True):
             if item.get("xref") == img_xref:
                 bbox = item.get("bbox")
                 if bbox and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
                     img_rect = fitz.Rect(bbox)
                 break
-
         if img_rect is None:
             size_map = {img[0]: (img[2], img[3]) for img in page.get_images(full=True)}
             target   = size_map.get(img_xref)
@@ -410,17 +403,14 @@ def _extract_caption_near_image(page, img_xref: int) -> str:
                         if bbox and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
                             img_rect = fitz.Rect(bbox)
                         break
-
         if img_rect is None or img_rect.is_empty:
             return ""
-
         caption_re = re.compile(
             r"\b(fig\.?|figure|plate|pl\.?|photo|photograph|map|plan|table)\b",
             re.IGNORECASE,
         )
         best_text = ""
         best_dist = float("inf")
-
         for block in page.get_text("blocks"):
             bx0, by0, bx1, by1 = block[0], block[1], block[2], block[3]
             text = block[4].strip()
@@ -432,11 +422,9 @@ def _extract_caption_near_image(page, img_xref: int) -> str:
             if dist < 200 and dist < best_dist:
                 best_dist = dist
                 best_text = text
-
         return best_text[:400] if best_text else ""
     except Exception:
         return ""
-
 
 def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
     doc_id   = doc_meta.get("id", hashlib.md5(str(pdf_path).encode()).hexdigest()[:10])
@@ -451,7 +439,6 @@ def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
 
     for page_num in range(len(doc)):
         page = doc[page_num]
-
         if _LAYOUT_AVAILABLE:
             page_text = page.get_text(
                 "text",
@@ -463,7 +450,7 @@ def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
 
         try:
             for t_idx, table in enumerate(page.find_tables()):
-                df = pd.DataFrame(table.extract())
+                df = __import__('pandas').DataFrame(table.extract())
                 page_text += (
                     f"\n[TABLE p.{page_num+1} t.{t_idx+1}]\n"
                     + df.to_string(index=False, header=False)
@@ -481,26 +468,20 @@ def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
                 if xref in seen_xrefs:
                     continue
                 seen_xrefs.add(xref)
-
                 base_img  = doc.extract_image(xref)
                 img_bytes = base_img["image"]
                 img_w     = base_img.get("width",  0)
                 img_h     = base_img.get("height", 0)
-
                 if img_w * img_h < MIN_IMAGE_PIXELS:
                     tiny_discarded += 1
                     continue
-
                 if _is_page_background(img_w, img_h):
                     bg_discarded += 1
                     continue
-
                 content_img_count += 1
                 img_path = img_dir / f"page_{page_num+1:04d}_img_{content_img_count:03d}.png"
                 Image.open(_io.BytesIO(img_bytes)).convert("RGB").save(img_path, "PNG")
-
                 caption = _extract_caption_near_image(page, xref)
-
                 image_records.append({
                     "doc_id":    doc_id,
                     "doc_title": doc_meta.get("title", ""),
@@ -509,27 +490,20 @@ def extract_pdf(pdf_path: Path, doc_meta: dict) -> tuple[list[str], list[dict]]:
                     "path":      str(img_path),
                     "caption":   caption,
                 })
-
                 if caption:
                     page_text += f"\n[FIGURE CAPTION p.{page_num+1}]: {caption}\n"
-
             except Exception as exc:
                 log.debug(f"  Image error p{page_num+1}: {exc}")
 
         full_text_pages.append(page_text)
 
     doc.close()
-
     if bg_discarded or tiny_discarded:
         log.info(f"  Discarded: {bg_discarded} backgrounds, {tiny_discarded} tiny images")
 
     chunks = _chunk_text("\n".join(full_text_pages))
-    log.info(
-        f"  Extracted {len(chunks)} chunks, {len(image_records)} content images "
-        f"from {pdf_path.name}"
-    )
+    log.info(f"  Extracted {len(chunks)} chunks, {len(image_records)} content images from {pdf_path.name}")
     return chunks, image_records
-
 
 def _chunk_text(text: str) -> list[str]:
     words   = text.split()
@@ -552,7 +526,7 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^\w\-_]", "_", name)[:60]
 
 # ─────────────────────────────────────────────
-# STAGE 3 - DEDUPLICATE + EMBED (Qdrant)
+# STAGE 3 - DEDUPLICATE + EMBED
 # ─────────────────────────────────────────────
 
 def embed_chunks_with_deduplication(
@@ -588,8 +562,6 @@ def embed_chunks_with_deduplication(
 
     is_empty = collection_count(client) == 0
     points: list[PointStruct] = []
-
-    # ── SUPPORT COUNTING ──
     support_updates: dict[int, dict] = {}
 
     for chunk, vector in zip(safe_chunks, vectors):
@@ -624,7 +596,6 @@ def embed_chunks_with_deduplication(
         if similarity >= SIMILARITY_DISCARD:
             existing_point_id = hits[0].id
             existing_doc_id   = hits[0].payload.get("doc_id", "")
-
             if existing_doc_id != doc_meta.get("id", ""):
                 if existing_point_id not in support_updates:
                     support_updates[existing_point_id] = {
@@ -632,20 +603,17 @@ def embed_chunks_with_deduplication(
                         "supporting_sources": [],
                     }
                 support_updates[existing_point_id]["supporting_sources"].append({
-                    "doc_id": doc_meta.get("id",     ""),
-                    "title":  doc_meta.get("title",  ""),
-                    "year":   doc_meta.get("year",   ""),
-                    "tier":   doc_meta.get("tier",   1),
+                    "doc_id": doc_meta.get("id",    ""),
+                    "title":  doc_meta.get("title", ""),
+                    "year":   doc_meta.get("year",  ""),
+                    "tier":   doc_meta.get("tier",  1),
                 })
-
             skipped += 1
-            log.debug(f"  SUPPORT (sim={similarity:.3f}): {chunk[:80]}...")
 
         elif similarity >= SIMILARITY_CHECK:
             if llm_checks >= MAX_LLM_CHECKS_PER_DOC:
                 points.append(_make_point(chunk, vector, doc_meta))
                 added += 1
-                log.debug(f"  LLM cap reached, adding as novel: {chunk[:80]}...")
             else:
                 llm_checks += 1
                 best_chunk = hits[0].payload.get("text", "")
@@ -659,38 +627,31 @@ def embed_chunks_with_deduplication(
                                 "supporting_sources": [],
                             }
                         support_updates[existing_point_id]["supporting_sources"].append({
-                            "doc_id": doc_meta.get("id",     ""),
-                            "title":  doc_meta.get("title",  ""),
-                            "year":   doc_meta.get("year",   ""),
-                            "tier":   doc_meta.get("tier",   1),
+                            "doc_id": doc_meta.get("id",    ""),
+                            "title":  doc_meta.get("title", ""),
+                            "year":   doc_meta.get("year",  ""),
+                            "tier":   doc_meta.get("tier",  1),
                         })
                     skipped += 1
-                    log.debug(f"  LLM-SUPPORT (sim={similarity:.3f}): {chunk[:80]}...")
                 else:
                     points.append(_make_point(chunk, vector, doc_meta))
                     added += 1
-
         else:
             points.append(_make_point(chunk, vector, doc_meta))
             added += 1
 
-    # ── APPLY SUPPORT COUNT UPDATES ──
     for point_id, update_data in support_updates.items():
         try:
             existing_payload = update_data["existing_payload"]
             new_sources      = update_data["supporting_sources"]
-
-            current_count   = existing_payload.get("support_count", 0)
-            current_sources = existing_payload.get("supporting_sources", [])
-
+            current_count    = existing_payload.get("support_count", 0)
+            current_sources  = existing_payload.get("supporting_sources", [])
             existing_doc_ids = {s["doc_id"] for s in current_sources}
             unique_new = [s for s in new_sources if s["doc_id"] not in existing_doc_ids]
-
             if unique_new:
                 updated_payload = dict(existing_payload)
-                updated_payload["support_count"]       = current_count + len(unique_new)
-                updated_payload["supporting_sources"]  = current_sources + unique_new
-
+                updated_payload["support_count"]      = current_count + len(unique_new)
+                updated_payload["supporting_sources"] = current_sources + unique_new
                 client.set_payload(
                     collection_name=QDRANT_COLLECTION,
                     payload=updated_payload,
@@ -702,15 +663,12 @@ def embed_chunks_with_deduplication(
     if points:
         client.upsert(collection_name=QDRANT_COLLECTION, points=points)
 
-    support_count = sum(
-        len(v["supporting_sources"]) for v in support_updates.values()
-    )
+    support_count = sum(len(v["supporting_sources"]) for v in support_updates.values())
     log.info(
         f"  Chunks: {added} added, {skipped} skipped "
         f"({support_count} support links recorded), {llm_checks} LLM checks"
     )
     return added, skipped, llm_checks
-
 
 def _make_point(chunk: str, vector: list[float], meta: dict) -> PointStruct:
     uid = hashlib.md5((chunk + meta.get("id", "")).encode()).hexdigest()
@@ -730,7 +688,6 @@ def _make_point(chunk: str, vector: list[float], meta: dict) -> PointStruct:
         },
     )
 
-
 def _llm_duplicate_check(chunk_a: str, chunk_b: str, llm: ChatOllama) -> bool:
     prompt = (
         "Are these two passages conveying the same factual information?\n"
@@ -740,8 +697,7 @@ def _llm_duplicate_check(chunk_a: str, chunk_b: str, llm: ChatOllama) -> bool:
     response = _invoke_with_timeout(llm, prompt, timeout_seconds=30)
     if response is None:
         return False
-    answer = strip_think_tags(response).strip().upper()
-    return answer.startswith("Y")
+    return strip_think_tags(response).strip().upper().startswith("Y")
 
 # ─────────────────────────────────────────────
 # STAGE 4 - DISTIL
@@ -769,31 +725,25 @@ without the specific name.
 CRITICAL GROUNDING RULES - these override everything else:
 - ONLY extract claims that are EXPLICITLY stated in the TEXT above.
 - Do NOT use your training knowledge. Do NOT infer. Do NOT guess.
-- If the TEXT does not clearly state a fact, omit it entirely. It is better to \
-  return fewer claims than to invent or embellish.
-- Every measurement, date, name, and location in your output MUST appear verbatim \
-  in the TEXT above. If you cannot find it in the TEXT, do not write it.
+- If the TEXT does not clearly state a fact, omit it entirely.
+- Every measurement, date, name, and location MUST appear verbatim in the TEXT.
 - If the TEXT contains no extractable factual claims, return the single word: NONE
 
 ANTI-DUPLICATION RULES - strictly enforced:
-- Every claim in your list must be about a DIFFERENT specific finding or measurement.
-- Do NOT repeat the same fact, measurement, or observation in multiple claims.
-- Do NOT rephrase or restate a claim you have already written.
-- Before writing each new claim, verify it is genuinely distinct from all previous claims.
-- If you run out of distinct claims before reaching {max_claims}, stop early rather \
-  than padding with repetitions.
+- Every claim must be about a DIFFERENT specific finding or measurement.
+- Do NOT repeat the same fact in multiple claims.
+- Do NOT rephrase a claim you have already written.
+- Stop early if you run out of distinct claims rather than padding with repetitions.
 
 Formatting rules:
 - Each claim MUST be exactly 2-4 complete sentences of continuous flowing prose.
-- NO bullet points, dashes, asterisks, or sub-items of any kind within a claim.
+- NO bullet points, dashes, asterisks, or sub-items within a claim.
 - Every sentence must name the specific subject.
-- Sentence 1: name the specific subject AND state the finding with numbers, \
-  measurements, or dates drawn directly from the TEXT.
-- Sentence 2: provide further context about that same named subject as stated in the TEXT.
-- Sentence 3 (if relevant): method used or significance, as stated in the TEXT.
-- If text contains [FIGURE CAPTION] markers, incorporate what the figure shows \
-  into the relevant claim, naming the subject.
-- EXCLUDE claims that only cite or summarise prior work without adding new data.
+- Sentence 1: name the subject AND state the finding with numbers/measurements/dates from TEXT.
+- Sentence 2: further context about that same named subject from TEXT.
+- Sentence 3 (if relevant): method used or significance, as stated in TEXT.
+- If text contains [FIGURE CAPTION] markers, incorporate what the figure shows.
+- EXCLUDE claims that only cite prior work without adding new data.
 - EXCLUDE vague statements with no specific data, numbers, or named subjects.
 - EXCLUDE any claim shorter than 2 full sentences.
 - Start each claim with its number followed by a period.
@@ -812,16 +762,11 @@ Source: {title} - {author} ({year})
 Top claims from this document:
 {claims_text}
 
-CRITICAL: Your title and summary must be based ONLY on the claims listed above. \
-Do not introduce any facts, names, or details that do not appear in those claims.
+CRITICAL: Your title and summary must be based ONLY on the claims listed above.
 
 Tasks:
-1. Write a SHORT descriptive title (8 words maximum) that names the specific \
-subject - the exact tomb, site, person, or object - and what the document \
-contributes about it. Never use vague phrases like "conservation methods" \
-without naming what was conserved and where.
-2. Write a 2-3 sentence summary that names the specific subject in the first \
-sentence. Every fact in the summary must come directly from the claims above.
+1. Write a SHORT descriptive title (8 words maximum) that names the specific subject.
+2. Write a 2-3 sentence summary naming the specific subject in the first sentence.
 
 Respond in this exact format and nothing else:
 TITLE: <title>
@@ -847,52 +792,34 @@ PURPOSE they served. Include mainstream, alternative, and speculative claims. \
 Include claims the author endorses AND claims the author merely mentions or debates.
 
 CRITICAL GROUNDING RULES:
-- ONLY extract claims that are present in the TEXT above.
-- Do NOT use your training knowledge. Do NOT infer. Do NOT fabricate.
-- If the TEXT contains NO claims about function or purpose, return the single word: NONE
-- Do not return NONE just because the claims are mundane - "the pyramid served \
-  as a tomb for the pharaoh" is a valid functional claim if stated in the TEXT.
+- ONLY extract claims present in the TEXT above.
+- Do NOT use training knowledge. Do NOT infer. Do NOT fabricate.
+- If the TEXT contains NO claims about function or purpose, return: NONE
+- "The pyramid served as a tomb" is valid if stated in the TEXT.
 
-What counts as a functional claim:
-- What the structure was built for or used as
-- How a specific feature or chamber functioned or operated
-- What astronomical, acoustic, hydraulic, spiritual, or engineering purpose it served
-- What the author believes the structure was designed to achieve
+What counts: what it was built for, how a feature functioned, what astronomical/
+acoustic/hydraulic/spiritual/engineering purpose it served.
 
-What does NOT count:
-- Pure architectural measurements without any stated purpose
-- Historical facts about who built it or when, unless linked to a purpose claim
-- Conservation or excavation methodology
+What does NOT count: pure measurements without stated purpose, historical facts
+about who built it unless linked to a purpose claim, conservation methodology.
 
 Output rules:
-- Each claim must be ONE clear sentence stating what the structure was for or \
-  how it worked.
-- Name the specific structure in every claim \
-  (e.g. "the Great Pyramid", "the King's Chamber", "the Grand Gallery", "the Sphinx").
-- Attribute the claim: use "According to {author}," if the author endorses it, \
-  or "The text notes the theory that" if the author is reporting others' views.
-- Include speculative and fringe claims if present in the text.
+- Each claim must be ONE clear sentence stating what the structure was for/how it worked.
+- Name the specific structure in every claim.
+- Attribute: "According to {author}," if endorsed, or "The text notes the theory that" if reported.
+- Include speculative and fringe claims if present.
 - Start each claim with its number followed by a period.
 
 Return ONLY a numbered list of single-sentence functional claims, \
-OR the single word NONE if no functional claims exist in the text. \
+OR the single word NONE if no functional claims exist. \
 No preamble. No commentary.
 """
-
 
 def distil_document(
     chunks: list[str],
     doc_meta: dict,
     llm: ChatOllama,
 ) -> tuple[list[dict], list[dict]]:
-    """
-    Distil chunks into:
-      - labelled factual claims (with doc summary)
-      - functional/speculative claims about pyramid purpose
-
-    Returns (claims, functional_claims).
-    Both lists may be empty if the document contains nothing extractable.
-    """
     if not chunks:
         log.info("  No chunks to distil")
         return [], []
@@ -925,8 +852,6 @@ def distil_document(
                     entry = re.sub(r'^[-*]\s*', '', entry).strip()
                     if entry.count('.') < 2 or len(entry) < 80:
                         continue
-                    # Lightweight post-processing duplicate suppression:
-                    # skip if opening 120 chars match an already-accepted claim
                     fingerprint = entry[:120].lower()
                     if fingerprint in seen_claims:
                         continue
@@ -951,7 +876,6 @@ def distil_document(
 
     log.info(f"  Distilled {len(claims)} claims")
 
-    # ── DOCUMENT SUMMARY (only if we have claims) ──
     if claims:
         claims_text = "\n".join(f"- {c['claim']}" for c in claims[:10])
         try:
@@ -983,7 +907,7 @@ def distil_document(
             c["doc_label"]   = doc_label
             c["doc_summary"] = doc_summary
 
-    # ── FUNCTIONAL / SPECULATIVE CLAIMS ──
+    # ── FUNCTIONAL CLAIMS ──
     functional_claims: list[dict] = []
     try:
         func_response = _invoke_with_timeout(
@@ -1031,11 +955,8 @@ def distil_document(
 # ─────────────────────────────────────────────
 
 def export_ideas() -> None:
-    """
-    Export all factual claims to CSV, enriched with support counts from Qdrant.
-    """
-    progress   = load_json(PROGRESS_FILE, {})
-    all_claims = [c for rec in progress.values() for c in rec.get("claims", [])]
+    store      = load_json(CLAIMS_FILE, {})
+    all_claims = [c for rec in store.values() for c in rec.get("claims", [])]
 
     if not all_claims:
         log.warning("No claims to export - run the pipeline first.")
@@ -1056,7 +977,6 @@ def export_ideas() -> None:
                     claim_text = " ".join(words[:CHUNK_SIZE])
                 if len(claim_text) > MAX_CHUNK_CHARS:
                     claim_text = claim_text[:MAX_CHUNK_CHARS]
-
                 vector  = emb.embed_query(claim_text)
                 results = client.query_points(
                     collection_name=QDRANT_COLLECTION,
@@ -1105,21 +1025,13 @@ def export_ideas() -> None:
             if sc > 0:
                 print(f"  [{sc} sources] {c['claim'][:120]}...")
 
-
 def export_functional_claims() -> None:
-    """
-    Export all functional/speculative claims about pyramid purpose to CSV.
-    These become the hypothesis input list for the evaluation engine.
-    """
-    progress   = load_json(PROGRESS_FILE, {})
-    all_claims = [
-        c for rec in progress.values()
-        for c in rec.get("functional_claims", [])
-    ]
+    store      = load_json(CLAIMS_FILE, {})
+    all_claims = [c for rec in store.values() for c in rec.get("functional_claims", [])]
 
     if not all_claims:
         log.warning("No functional claims to export.")
-        print("No functional claims found. These are collected during processing.")
+        print("No functional claims found.")
         return
 
     fieldnames = [
@@ -1144,19 +1056,13 @@ def process_one(
     client:   QdrantClient,
     llm:      ChatOllama,
 ) -> tuple[list[dict], list[dict], list[dict]]:
-    """
-    Run the full pipeline for one document.
-    Returns (claims, functional_claims, image_refs).
-    """
     log.info(f"\n{'='*60}")
     log.info(f"Processing: {doc_meta.get('title','?')}")
     log.info(f"  Author: {doc_meta.get('author','?')}  Year: {doc_meta.get('year','?')}  Tier: {doc_meta.get('tier',1)}")
-
     chunks, image_refs        = extract_pdf(pdf_path, doc_meta)
     embed_chunks_with_deduplication(chunks, doc_meta, image_refs, client, llm)
     claims, functional_claims = distil_document(chunks, doc_meta, llm)
     return claims, functional_claims, image_refs
-
 
 def download_pdf(url: str, dest_dir: Path, filename: str) -> Optional[Path]:
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1191,6 +1097,7 @@ def cmd_run(args) -> None:
         print("No manifest found. Run:  python knowledge_pipeline.py crawl")
         return
 
+    # Load lightweight index only - fast
     progress         = load_json(PROGRESS_FILE, {})
     processed_titles = load_json(PROCESSED_TITLES, [])
 
@@ -1236,19 +1143,24 @@ def cmd_run(args) -> None:
 
         try:
             claims, functional_claims, _ = process_one(entry, pdf_path, client, llm)
+
+            # Update lightweight index
             progress[doc_id] = {
-                "title":             title,
-                "author":            entry["author"],
-                "year":              entry["year"],
-                "tier":              entry.get("tier", 1),
-                "claims":            claims,
-                "functional_claims": functional_claims,
-                "completed":         datetime.now().isoformat(timespec="seconds"),
+                "title":     title,
+                "year":      entry["year"],
+                "tier":      entry.get("tier", 1),
+                "completed": datetime.now().isoformat(timespec="seconds"),
+                "has_claims": len(claims) > 0,
             }
+            save_json(PROGRESS_FILE, progress)
+
+            # Write claims to separate store
+            append_claims_to_store(doc_id, claims, functional_claims)
+
             if title not in processed_titles:
                 processed_titles.append(title)
-            save_json(PROGRESS_FILE,    progress)
             save_json(PROCESSED_TITLES, processed_titles)
+
             done += 1
             log.info(f"  Done ({done} this session)")
 
@@ -1257,16 +1169,11 @@ def cmd_run(args) -> None:
             progress[doc_id] = {"error": str(exc)}
             save_json(PROGRESS_FILE, progress)
 
-    total = sum(1 for v in progress.values() if "claims" in v)
+    total = sum(1 for v in progress.values() if v.get("has_claims"))
     print(f"\nSession: {done} processed this run, {total} total in knowledge base.")
 
 
 def cmd_folder(args) -> None:
-    """
-    Process all PDFs found in a local folder (and subfolders).
-    Useful for Tier 2/3/4 manually downloaded sources.
-    Already-processed titles are skipped automatically.
-    """
     folder = Path(args.folder_path)
     if not folder.exists() or not folder.is_dir():
         print(f"Folder not found: {folder}")
@@ -1282,6 +1189,7 @@ def cmd_folder(args) -> None:
 
     log.info(f"Found {len(pdf_files)} PDF(s) in {folder} (Tier {tier})")
 
+    # Load lightweight index only - fast
     progress         = load_json(PROGRESS_FILE, {})
     processed_titles = load_json(PROCESSED_TITLES, [])
 
@@ -1327,19 +1235,24 @@ def cmd_folder(args) -> None:
 
         try:
             claims, functional_claims, _ = process_one(doc_meta, pdf_path, client, llm)
+
+            # Update lightweight index
             progress[doc_id] = {
-                "title":             title,
-                "author":            "Unknown",
-                "year":              year,
-                "tier":              tier,
-                "claims":            claims,
-                "functional_claims": functional_claims,
-                "completed":         datetime.now().isoformat(timespec="seconds"),
+                "title":     title,
+                "year":      year,
+                "tier":      tier,
+                "completed": datetime.now().isoformat(timespec="seconds"),
+                "has_claims": len(claims) > 0,
             }
+            save_json(PROGRESS_FILE, progress)
+
+            # Write claims to separate store
+            append_claims_to_store(doc_id, claims, functional_claims)
+
             if title not in processed_titles:
                 processed_titles.append(title)
-            save_json(PROGRESS_FILE,    progress)
             save_json(PROCESSED_TITLES, processed_titles)
+
             done += 1
             log.info(f"  Done ({done} this session)")
 
@@ -1348,7 +1261,7 @@ def cmd_folder(args) -> None:
             progress[doc_id] = {"error": str(exc)}
             save_json(PROGRESS_FILE, progress)
 
-    total = sum(1 for v in progress.values() if "claims" in v)
+    total = sum(1 for v in progress.values() if v.get("has_claims"))
     print(f"\nSession: {done} processed this run, {total} total in knowledge base.")
 
 
@@ -1397,8 +1310,7 @@ def cmd_single(args) -> None:
         fieldnames = [
             "claim", "doc_label", "doc_summary",
             "doc_id", "title", "author", "year", "type", "tier",
-            "support_count", "supporting_sources",
-            "pdf_url", "extracted",
+            "support_count", "supporting_sources", "pdf_url", "extracted",
         ]
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -1410,14 +1322,12 @@ def cmd_single(args) -> None:
         img_csv = DATA_DIR / f"images_{doc_meta['id']}.csv"
         with open(img_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(
-                f,
-                fieldnames=["doc_id","doc_title","page","img_index","path","caption"],
+                f, fieldnames=["doc_id","doc_title","page","img_index","path","caption"],
                 extrasaction="ignore",
             )
             writer.writeheader()
             writer.writerows(image_refs)
         print(f"Images  -> {img_csv}")
-
         captioned = [r for r in image_refs if r.get("caption")]
         print(f"\nContent images saved: {len(image_refs)}")
         if captioned:
@@ -1431,7 +1341,6 @@ def cmd_single(args) -> None:
 def cmd_export(_args) -> None:
     export_ideas()
 
-
 def cmd_export_functions(_args) -> None:
     export_functional_claims()
 
@@ -1439,7 +1348,7 @@ def cmd_export_functions(_args) -> None:
 def cmd_purge(_args) -> None:
     import shutil
     confirm = input(
-        "This will delete the vector DB, progress, and processed titles.\n"
+        "This will delete the vector DB, progress index, claims store, and processed titles.\n"
         "Type YES to confirm: "
     )
     if confirm.strip().upper() != "YES":
@@ -1457,7 +1366,7 @@ def cmd_purge(_args) -> None:
         shutil.rmtree(QDRANT_PATH)
         print(f"Deleted {QDRANT_PATH}")
 
-    for f in [PROGRESS_FILE, PROCESSED_TITLES]:
+    for f in [PROGRESS_FILE, CLAIMS_FILE, PROCESSED_TITLES]:
         if f.exists():
             f.unlink()
             print(f"Deleted {f}")
@@ -1467,20 +1376,27 @@ def cmd_purge(_args) -> None:
 
 def cmd_status(_args) -> None:
     manifest  = load_json(MANIFEST_FILE,  [])
-    progress  = load_json(PROGRESS_FILE,  {})
+    progress  = load_json(PROGRESS_FILE,  {})   # tiny - loads instantly
     titles    = load_json(PROCESSED_TITLES, [])
 
-    total        = len(manifest)
-    completed    = sum(1 for v in progress.values() if "claims"        in v)
-    errors       = sum(1 for v in progress.values() if "error"         in v)
-    skipped      = sum(1 for v in progress.values() if "skipped_title" in v)
-    remaining    = total - len(progress)
-    total_claims = sum(len(v.get("claims", [])) for v in progress.values())
-    total_func   = sum(len(v.get("functional_claims", [])) for v in progress.values())
+    # Count claims from store only if it exists
+    total_claims = 0
+    total_func   = 0
+    if CLAIMS_FILE.exists():
+        store = load_json(CLAIMS_FILE, {})
+        total_claims = sum(len(v.get("claims", []))            for v in store.values())
+        total_func   = sum(len(v.get("functional_claims", [])) for v in store.values())
+
+    total     = len(manifest)
+    completed = sum(1 for v in progress.values() if v.get("completed"))
+    errors    = sum(1 for v in progress.values() if v.get("error"))
+    skipped   = sum(1 for v in progress.values() if v.get("skipped_title"))
+    with_claims = sum(1 for v in progress.values() if v.get("has_claims"))
+    remaining = total - len(progress)
 
     tier_counts: dict[int, int] = {}
     for v in progress.values():
-        if "claims" in v:
+        if v.get("has_claims"):
             t = v.get("tier", 1)
             tier_counts[t] = tier_counts.get(t, 0) + 1
 
@@ -1491,9 +1407,13 @@ def cmd_status(_args) -> None:
     except Exception:
         qdrant_n = "unavailable"
 
-    print(f"\n{'='*44}")
+    # File sizes
+    idx_size    = f"{PROGRESS_FILE.stat().st_size/1024:.0f} KB" if PROGRESS_FILE.exists() else "—"
+    claims_size = f"{CLAIMS_FILE.stat().st_size/1024/1024:.1f} MB" if CLAIMS_FILE.exists() else "—"
+
+    print(f"\n{'='*48}")
     print(f"  KNOWLEDGE PIPELINE STATUS")
-    print(f"{'='*44}")
+    print(f"{'='*48}")
     print(f"  Library URL       : {LIBRARY_URL or '(not set)'}")
     print(f"  Manifest PDFs     : {total}")
     print(f"  Completed         : {completed}")
@@ -1502,14 +1422,17 @@ def cmd_status(_args) -> None:
     print(f"  Remaining         : {remaining}")
     print(f"  Factual claims    : {total_claims}")
     print(f"  Functional claims : {total_func}")
+    print(f"  With claims       : {with_claims}")
     print(f"  Unique titles     : {len(titles)}")
     print(f"  Qdrant vectors    : {qdrant_n}")
+    print(f"  Index size        : {idx_size}")
+    print(f"  Claims store size : {claims_size}")
     if tier_counts:
         print(f"  By tier           :", end="")
         for t in sorted(tier_counts):
             print(f"  Tier {t}: {tier_counts[t]}", end="")
         print()
-    print(f"{'='*44}\n")
+    print(f"{'='*48}\n")
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -1526,39 +1449,24 @@ def main() -> None:
     sub.add_parser("crawl", help="Stage 1: crawl library, build manifest")
 
     p_run = sub.add_parser("run", help="Stages 2-4: process PDFs from manifest")
-    p_run.add_argument(
-        "--limit", type=int, default=None,
-        help="Process at most N unprocessed documents this session",
-    )
+    p_run.add_argument("--limit", type=int, default=None)
 
     p_folder = sub.add_parser("folder", help="Process all PDFs in a local folder")
-    p_folder.add_argument("folder_path", help="Path to folder containing PDFs")
-    p_folder.add_argument(
-        "--tier", type=int, default=1,
-        help="Source tier (1=primary measurements, 2=peer reviewed, 3=alternative with measurements). Default: 1",
-    )
-    p_folder.add_argument(
-        "--limit", type=int, default=None,
-        help="Process at most N PDFs this session",
-    )
+    p_folder.add_argument("folder_path")
+    p_folder.add_argument("--tier", type=int, default=1)
+    p_folder.add_argument("--limit", type=int, default=None)
 
     p_single = sub.add_parser("single", help="Test pipeline on a single local PDF")
-    p_single.add_argument("path", help="Path to PDF file")
+    p_single.add_argument("path")
     p_single.add_argument("--title",  default=None)
     p_single.add_argument("--author", default=None)
     p_single.add_argument("--year",   default=None)
-    p_single.add_argument(
-        "--type", default=None,
-        help="publication / book / article / field_report / thesis",
-    )
-    p_single.add_argument(
-        "--tier", type=int, default=1,
-        help="Source tier. Default: 1",
-    )
+    p_single.add_argument("--type",   default=None)
+    p_single.add_argument("--tier",   type=int, default=1)
 
-    sub.add_parser("export",           help="Export factual claims to CSV with support counts")
+    sub.add_parser("export",           help="Export factual claims to CSV")
     sub.add_parser("export_functions", help="Export functional/speculative claims to CSV")
-    sub.add_parser("purge",            help="Wipe vector DB and progress files")
+    sub.add_parser("purge",            help="Wipe DB and progress files")
     sub.add_parser("status",           help="Show progress summary")
 
     args = parser.parse_args()
@@ -1576,7 +1484,6 @@ def main() -> None:
         dispatch[args.command](args)
     else:
         parser.print_help()
-
 
 if __name__ == "__main__":
     main()
