@@ -75,6 +75,7 @@ DISTILL_MAX_CLAIMS   = int(os.getenv("DISTILL_MAX_CLAIMS",  "40"))
 # Every word of every document is processed — no truncation.
 # 6000 words ≈ one batch call of ~2 minutes for deepseek-r1:14b.
 DISTILL_BATCH_WORDS  = int(os.getenv("DISTILL_BATCH_WORDS", "6000"))
+DISTILL_TIMEOUT = int(os.getenv("DISTILL_TIMEOUT", "300"))
 
 TEMPERATURE          = float(os.getenv("TEMPERATURE",       "0.3"))
 MAX_TOKENS           = int(os.getenv("MAX_TOKENS",          "8192"))
@@ -586,6 +587,7 @@ def embed_chunks_with_deduplication(
                 limit=1,
             )
             hits = results.points
+            time.sleep(0.05)
         except Exception:
             points.append(_make_point(chunk, vector, doc_meta))
             added += 1
@@ -882,7 +884,7 @@ def distil_document(
                     text       = batch_text,
                     max_claims = DISTILL_MAX_CLAIMS,
                 ),
-                timeout_seconds=120,
+                timeout_seconds = DISTILL_TIMEOUT,
             )
             if response is not None:
                 raw = strip_think_tags(response).strip()
@@ -910,7 +912,7 @@ def distil_document(
                     doc_type = doc_meta.get("type",   "publication"),
                     text     = batch_text,
                 ),
-                timeout_seconds=120,
+                timeout_seconds = DISTILL_TIMEOUT,
             )
             if func_response is not None:
                 func_raw = strip_think_tags(func_response).strip()
